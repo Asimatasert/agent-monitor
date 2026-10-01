@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+panel.db
+panel.db-*
+panel.log
+.DS_Store
+/screenshots/
+/menubar/build/
+/menubar/AgentBar.xcodeproj/
+_uicheck/

@@ -1,0 +1,65 @@
+# XcodeGen spec for Agent Bar + its desktop widget. make-menubar.sh generates the project and builds it;
+# signing identity and team come from your keychain at build time, nothing personal is stored here.
+name: AgentBar
+options:
+  bundleIdPrefix: local.agent
+  deploymentTarget:
+    macOS: "14.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    OTHER_SWIFT_FLAGS: "-parse-as-library"
+    CODE_SIGN_STYLE: Manual
+    ENABLE_HARDENED_RUNTIME: NO
+    MARKETING_VERSION: "0.3.0"
+    CURRENT_PROJECT_VERSION: "1"
+targets:
+  AgentBar:
+    type: application
+    platform: macOS
+    sources:
+      - AgentBar.swift
+      - path: icons
+        type: folder
+        buildPhase: resources
+      - path: ../AgentMonitor.icns
+        buildPhase: resources
+    info:
+      path: build/App-Info.plist
+      properties:
+        CFBundleDisplayName: Agent Bar
+        CFBundleName: Agent Bar
+        CFBundleIconFile: AgentMonitor
+        LSUIElement: true
+        NSAppTransportSecurity: { NSAllowsLocalNetworking: true }
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.agent.bar
+        PRODUCT_NAME: Agent Bar
+        EXECUTABLE_NAME: AgentBar
+    dependencies:
+      - target: AgentBarWidget
+        embed: true
+  AgentBarWidget:
+    type: app-extension
+    platform: macOS
+    sources:
+      - AgentBarWidget.swift
+      - path: icons
+        type: folder
+        buildPhase: resources
+    info:
+      path: build/Widget-Info.plist
+      properties:
+        CFBundleDisplayName: Agent Monitor
+        NSExtension: { NSExtensionPointIdentifier: com.apple.widgetkit-extension }
+        NSAppTransportSecurity: { NSAllowsLocalNetworking: true }
+    entitlements:
+      path: build/Widget.entitlements
+      properties:
+        # sandbox is mandatory for widgets; network-client lets it read the local API and nothing else
+        com.apple.security.app-sandbox: true
+        com.apple.security.network.client: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: local.agent.bar.widget

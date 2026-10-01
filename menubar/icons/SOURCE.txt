@@ -1,0 +1,2 @@
+Provider logos from Simple Icons (https://simpleicons.org, CC0), fetched from
+https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/<name>.svg. Brand marks belong to their owners.

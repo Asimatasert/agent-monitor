@@ -1,0 +1,1086 @@
+<!doctype html>
+<html lang="tr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Agent Monitor</title>
+<style>
+:root {
+  color-scheme: light;
+  --bg: #f3f3f1; --surface: #fcfcfb; --surface-2: #f0efec; --line: #e2e1dc; --grid: #ebeae6;
+  --text: #0b0b0b; --text-2: #52514e; --muted: #85847e;
+  --s1: #2a78d6; --s2: #eb6834; --s3: #1baf7a; --s4: #eda100; --s5: #e87ba4; --other: #a3a29c;
+  --good: #0ca30c; --warn: #fab219; --serious: #ec835a; --critical: #d03b3b;
+  --accent: #2a78d6; --accent-wash: rgba(42,120,214,.10);
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #121211; --surface: #1a1a19; --surface-2: #222220; --line: #2c2c29; --grid: #262624;
+    --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
+    --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --other: #6d6c67;
+    --accent: #3987e5; --accent-wash: rgba(57,135,229,.16);
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #121211; --surface: #1a1a19; --surface-2: #222220; --line: #2c2c29; --grid: #262624;
+  --text: #ffffff; --text-2: #c3c2b7; --muted: #8d8c85;
+  --s1: #3987e5; --s2: #d95926; --s3: #199e70; --s4: #c98500; --s5: #d55181; --other: #6d6c67;
+  --accent: #3987e5; --accent-wash: rgba(57,135,229,.16);
+}
+* { box-sizing: border-box; }
+html, body { margin: 0; height: 100%; }
+body { background: var(--bg); color: var(--text); font: 13.5px/1.45 -apple-system, BlinkMacSystemFont, "SF Pro Text", "Segoe UI", sans-serif;
+       -webkit-font-smoothing: antialiased; }
+.app { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
+nav { background: var(--surface); border-right: 1px solid var(--line); padding: 18px 10px; position: sticky; top: 0; height: 100vh;
+      display: flex; flex-direction: column; gap: 2px; }
+.brand { display: flex; align-items: center; gap: 9px; padding: 0 10px 18px; font-weight: 650; font-size: 15px; }
+.brand svg { flex: none; }
+nav a { display: flex; align-items: center; gap: 10px; padding: 7px 10px; border-radius: 7px; color: var(--text-2);
+        text-decoration: none; font-weight: 500; }
+nav a:hover { background: var(--surface-2); color: var(--text); }
+nav a.on { background: var(--accent-wash); color: var(--text); }
+nav a svg { width: 16px; height: 16px; flex: none; }
+nav a .badge { margin-left: auto; font-size: 11px; font-variant-numeric: tabular-nums; color: var(--text-2);
+               background: var(--surface-2); border-radius: 999px; padding: 0 7px; }
+nav { overflow-y: auto; }
+.side { margin: 14px 4px 0; padding-top: 14px; border-top: 1px solid var(--line); display: grid; gap: 16px; }
+.side h5 { margin: 0 0 7px; font-size: 10.5px; font-weight: 600; letter-spacing: .07em; text-transform: uppercase; color: var(--muted);
+           display: flex; justify-content: space-between; align-items: baseline; }
+.side h5 span { text-transform: none; letter-spacing: 0; font-weight: 500; }
+.sq { margin-bottom: 8px; }
+.sq .r { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-2); }
+.sq .r b { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; }
+.sq .track { height: 5px; margin: 4px 0 2px; }
+.sq .sub { font-size: 10.5px; }
+.sbad { display: flex; align-items: center; gap: 6px; font-size: 11.5px; color: var(--text-2); margin-top: 4px; }
+.sbad i { width: 6px; height: 6px; border-radius: 50%; background: var(--critical); flex: none; }
+.sbig { display: flex; align-items: baseline; gap: 6px; }
+.sbig b { font-size: 20px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+.sbig span { font-size: 11px; color: var(--muted); }
+.srun { display: grid; gap: 2px; }
+.srun a { display: grid; grid-template-columns: 8px 1fr auto; gap: 7px; align-items: center; padding: 4px 6px; margin: 0 -6px;
+          border-radius: 6px; color: var(--text-2); font-size: 11.5px; font-weight: 400; text-decoration: none; }
+.srun a:hover { background: var(--surface-2); color: var(--text); }
+.srun a .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.srun a .t small { display: block; color: var(--muted); font-size: 10.5px; overflow: hidden; text-overflow: ellipsis; }
+.srun a .e { font-size: 10.5px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.srun .d { width: 7px; height: 7px; border-radius: 50%; }
+.ssrc { display: flex; height: 6px; border-radius: 3px; overflow: hidden; gap: 2px; margin-bottom: 6px; }
+.slg { display: grid; gap: 3px; font-size: 11px; color: var(--text-2); }
+.slg div { display: flex; justify-content: space-between; }
+.slg i { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 6px; vertical-align: -.5px; }
+.slg b { font-variant-numeric: tabular-nums; font-weight: 600; color: var(--text); }
+nav .foot { margin-top: auto; padding: 10px; font-size: 11.5px; color: var(--muted); display: grid; gap: 6px; }
+.live-dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; background: var(--good); }
+.live-dot.pulse { animation: pulse 1.6s ease-out infinite; }
+@keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(12,163,12,.55); } 70% { box-shadow: 0 0 0 7px rgba(12,163,12,0); } 100% { box-shadow: 0 0 0 0 rgba(12,163,12,0); } }
+.live-dot.stale { background: var(--critical); animation: none; }
+main { padding: 18px 26px 48px; min-width: 0; }
+.top { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 18px; }
+.top h1 { font-size: 20px; margin: 0 12px 0 0; font-weight: 650; letter-spacing: -.01em; }
+.seg { display: inline-flex; background: var(--surface); border: 1px solid var(--line); border-radius: 8px; padding: 2px; }
+.seg button { border: 0; background: none; color: var(--text-2); font: inherit; font-size: 12.5px; padding: 4px 10px; border-radius: 6px; cursor: pointer; }
+.seg button.on { background: var(--surface-2); color: var(--text); font-weight: 600; }
+.ctl { font: inherit; font-size: 12.5px; background: var(--surface); color: var(--text); border: 1px solid var(--line); border-radius: 8px; padding: 4px 8px; }
+button.ctl { cursor: pointer; }
+button.ctl:hover { border-color: var(--muted); }
+.custom { display: none; gap: 6px; align-items: center; }
+.custom.show { display: inline-flex; }
+.filters { display: none; align-items: center; gap: 8px; flex-wrap: wrap; margin: -6px 0 16px; }
+.filters.show { display: flex; }
+.filters .search { position: relative; }
+.filters .search input { padding-left: 26px; width: 220px; }
+.filters .search svg { position: absolute; left: 8px; top: 50%; transform: translateY(-50%); width: 13px; height: 13px; color: var(--muted); pointer-events: none; }
+.filters select.active, .filters input.active { border-color: var(--accent); background: var(--accent-wash); }
+.filters .count { font-size: 12px; color: var(--muted); }
+.filters .clear { display: none; }
+.filters .clear.show { display: inline-block; }
+.top .meta { margin-left: auto; color: var(--muted); font-size: 12px; }
+.grid { display: grid; gap: 14px; }
+.g-kpi { grid-template-columns: repeat(auto-fill, minmax(165px, 1fr)); }
+.g2 { grid-template-columns: repeat(auto-fit, minmax(420px, 1fr)); }
+.g3 { grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); }
+.span2 { grid-column: 1 / -1; }
+.card { background: var(--surface); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; min-width: 0; }
+.card-h { display: flex; align-items: baseline; gap: 8px; margin-bottom: 10px; }
+.card-h h3 { margin: 0; font-size: 13.5px; font-weight: 620; }
+.card-h .sub { font-size: 12px; }
+.card-h .tools { margin-left: auto; display: flex; gap: 6px; }
+.link { border: 0; background: none; color: var(--text-2); font: inherit; font-size: 12px; cursor: pointer; padding: 0; text-decoration: underline; text-underline-offset: 2px; }
+.sub { color: var(--muted); }
+.kpi .label { color: var(--text-2); font-size: 12px; }
+.kpi .value { font-size: 24px; font-weight: 650; letter-spacing: -.02em; font-variant-numeric: tabular-nums; margin-top: 2px; }
+.kpi .hint { color: var(--muted); font-size: 11.5px; margin-top: 2px; }
+section.page { display: none; }
+section.page.on { display: block; }
+.stack > * + * { margin-top: 14px; }
+.legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); margin-bottom: 8px; }
+.legend i { display: inline-block; width: 10px; height: 10px; border-radius: 3px; margin-right: 6px; vertical-align: -1px; }
+.legend i.line { height: 2px; border-radius: 1px; vertical-align: 3px; width: 14px; }
+svg.chart { display: block; width: 100%; overflow: visible; }
+svg.chart text { fill: var(--muted); font-size: 10.5px; font-variant-numeric: tabular-nums; }
+svg.chart .gridline { stroke: var(--grid); stroke-width: 1; }
+svg.chart .axis { stroke: var(--line); }
+svg.chart .hit { fill: transparent; cursor: default; }
+svg.chart .hover-band { fill: var(--text); opacity: .05; }
+.updating { opacity: .55; transition: opacity .2s; }
+.tip { position: fixed; z-index: 50; pointer-events: none; background: var(--surface); border: 1px solid var(--line); border-radius: 8px;
+       box-shadow: 0 6px 22px rgba(0,0,0,.14); padding: 8px 10px; font-size: 12px; min-width: 150px; display: none; }
+.tip .t { color: var(--text-2); margin-bottom: 4px; }
+.tip .r { display: flex; align-items: center; gap: 8px; justify-content: space-between; }
+.tip .r b { font-variant-numeric: tabular-nums; }
+.tip .r span { color: var(--text-2); display: inline-flex; align-items: center; gap: 6px; }
+.tip .r span i { display: inline-block; width: 12px; height: 2px; border-radius: 1px; }
+table { width: 100%; border-collapse: collapse; }
+th, td { text-align: left; padding: 7px 10px; border-bottom: 1px solid var(--line); vertical-align: top; }
+th { font-size: 11px; font-weight: 600; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; white-space: nowrap; }
+tr:last-child td { border-bottom: 0; }
+td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.scroll { overflow-x: auto; }
+.status { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; white-space: nowrap; }
+.status svg { width: 12px; height: 12px; flex: none; }
+.gauge { margin: 10px 0 4px; }
+.gauge .row { display: flex; justify-content: space-between; font-size: 12.5px; }
+.gauge .row b { font-variant-numeric: tabular-nums; }
+.track { height: 8px; background: var(--surface-2); border-radius: 4px; overflow: hidden; margin: 5px 0 3px; }
+.fill { height: 100%; border-radius: 4px; transition: width .6s ease; }
+.acct { display: flex; justify-content: space-between; gap: 8px; font-size: 12px; padding: 5px 0; border-top: 1px solid var(--line); }
+.tree { display: grid; gap: 10px; }
+.node { border: 1px solid var(--line); border-radius: 10px; padding: 10px 12px; background: var(--surface); }
+.node.root { border-left: 3px solid var(--accent); }
+.node .head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.node .title { font-weight: 600; }
+.node .meta { color: var(--muted); font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; margin-top: 3px; }
+.node .meta b { color: var(--text-2); font-weight: 600; font-variant-numeric: tabular-nums; }
+.node .act { color: var(--text-2); font-size: 12px; margin-top: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.children { margin: 8px 0 0 12px; padding-left: 12px; border-left: 1px dashed var(--line); display: grid; gap: 6px; }
+.child { padding: 6px 0; }
+.flash { animation: flash 1s ease-out; }
+@keyframes flash { from { color: var(--good); } to { color: inherit; } }
+.chip { font-size: 11px; color: var(--text-2); background: var(--surface-2); border-radius: 999px; padding: 1px 8px; white-space: nowrap; }
+.cols { display: grid; gap: 12px; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); }
+.col h4 { margin: 0 0 8px; font-size: 12.5px; display: flex; justify-content: space-between; align-items: center; }
+.kcard { background: var(--bg); border: 1px solid var(--line); border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; font-size: 12.5px; }
+.kcard .sub { font-size: 11.5px; margin-top: 2px; }
+.err { color: var(--critical); font-size: 12px; }
+.empty { color: var(--muted); padding: 14px 0; font-size: 13px; }
+.note { font-size: 12px; color: var(--muted); margin-top: 6px; }
+.spark { display: block; }
+@media (max-width: 860px) {
+  .app { grid-template-columns: 1fr; }
+  nav { position: static; height: auto; flex-direction: row; overflow-x: auto; padding: 8px; }
+  .brand, nav .foot, .side { display: none; }
+  nav a { white-space: nowrap; }
+  main { padding: 14px 16px 40px; }
+  .g2 { grid-template-columns: 1fr; }
+}
+</style>
+</head>
+<body>
+<div class="app">
+  <nav id="nav">
+    <div class="brand">
+      <svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12h4l3-8 4 16 3-8h4"/></svg>
+      Agent Monitor
+    </div>
+  </nav>
+  <main>
+    <div class="top">
+      <h1 id="title">Canlı</h1>
+      <div class="seg" id="ranges"></div>
+      <span class="custom" id="custom">
+        <input type="date" class="ctl" id="from"> – <input type="date" class="ctl" id="to">
+      </span>
+      <select class="ctl" id="profile"><option value="">Tüm ajanlar</option></select>
+      <span class="meta" id="meta"></span>
+    </div>
+    <div class="filters" id="filters">
+      <span class="search"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="m20 20-3.5-3.5"/></svg><input class="ctl" id="f-q" type="search" placeholder="Ara…"></span>
+      <select class="ctl" id="f-source"></select>
+      <select class="ctl" id="f-provider"></select>
+      <select class="ctl" id="f-model"></select>
+      <select class="ctl" id="f-status"></select>
+      <button class="ctl clear" id="f-clear">Temizle</button>
+      <span class="count" id="f-count"></span>
+    </div>
+    <section class="page" id="p-live"></section>
+    <section class="page" id="p-overview"></section>
+    <section class="page" id="p-accounts"></section>
+    <section class="page" id="p-agents"></section>
+    <section class="page" id="p-subagents"></section>
+    <section class="page" id="p-clis"></section>
+    <section class="page" id="p-kanban"></section>
+  </main>
+</div>
+<div class="tip" id="tip"></div>
+<script>
+// ---------- utilities ----------
+const $ = id => document.getElementById(id);
+function h(tag, attrs, ...kids) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs || {})) {
+    if (v == null || v === false) continue;
+    if (k === 'class') el.className = v;
+    else if (k === 'style') el.style.cssText = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v);
+  }
+  for (const kid of kids.flat()) if (kid != null && kid !== false) el.append(kid instanceof Node ? kid : document.createTextNode(String(kid)));
+  return el;
+}
+const SVGNS = 'http://www.w3.org/2000/svg';
+function s(tag, attrs, ...kids) {
+  const el = document.createElementNS(SVGNS, tag);
+  for (const [k, v] of Object.entries(attrs || {})) if (v != null) el.setAttribute(k, v);
+  for (const kid of kids.flat()) if (kid) el.append(kid);
+  return el;
+}
+const nfc = new Intl.NumberFormat('tr-TR', { notation: 'compact', maximumFractionDigits: 1 });
+const nfi = new Intl.NumberFormat('tr-TR');
+const fmtN = v => nfc.format(v || 0);
+const fmtUsd = v => '$' + (v || 0).toLocaleString('tr-TR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fmtPct = v => v == null ? '—' : '%' + Math.round(v);
+const dayLabel = d => new Date(d + 'T00:00').toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' });
+const timeLabel = t => new Date(t * 1000).toLocaleTimeString('tr-TR', { hour: '2-digit', minute: '2-digit' });
+function ago(t) {
+  if (!t) return '—';
+  const x = Date.now() / 1000 - t;
+  if (x < 5) return 'şimdi';
+  if (x < 60) return Math.floor(x) + ' sn önce';
+  if (x < 3600) return Math.floor(x / 60) + ' dk önce';
+  if (x < 86400) return Math.floor(x / 3600) + ' sa önce';
+  return Math.floor(x / 86400) + ' gün önce';
+}
+function dur(sec) {
+  if (sec == null) return '—';
+  sec = Math.max(0, Math.floor(sec));
+  if (sec < 60) return sec + ' sn';
+  if (sec < 3600) return Math.floor(sec / 60) + ' dk ' + (sec % 60) + ' sn';
+  return Math.floor(sec / 3600) + ' sa ' + Math.floor((sec % 3600) / 60) + ' dk';
+}
+function until(t) {
+  if (!t) return '';
+  const x = t - Date.now() / 1000;
+  if (x <= 0) return 'sıfırlandı';
+  return dur(x).replace(/ \d+ sn$/, '') + ' sonra sıfırlanır';
+}
+const store = {
+  get(k, d) { try { return JSON.parse(localStorage.getItem('hm:' + k)) ?? d; } catch { return d; } },
+  set(k, v) { try { localStorage.setItem('hm:' + k, JSON.stringify(v)); } catch {} },
+};
+
+// Color follows the entity (provider), never its rank.
+const PROVIDER_SLOT = { 'anthropic': 's1', 'openai-codex': 's2', 'nvidia': 's3', 'gemini': 's4', 'copilot': 's5' };
+const PROVIDER_NAME = { 'anthropic': 'Anthropic (Claude)', 'openai-codex': 'OpenAI Codex', 'nvidia': 'NVIDIA', 'gemini': 'Google Gemini',
+  'copilot': 'GitHub Copilot', 'openrouter': 'OpenRouter', 'bilinmiyor': 'Bilinmiyor' };
+const pColor = p => `var(--${PROVIDER_SLOT[String(p).split('#')[0]] || 'other'})`;
+// Sources (Hermes + agent CLIs) have their own fixed slot order.
+const SOURCE_SLOT = { 'hermes': 's1', 'claude-code': 's2', 'copilot-cli': 's3', 'gemini-cli': 's4', 'droid': 's5' };
+const SOURCE_NAME = { 'hermes': 'Hermes', 'claude-code': 'Claude Code', 'copilot-cli': 'Copilot CLI', 'gemini-cli': 'Gemini / Antigravity', 'droid': 'Factory Droid' };
+const srcColor = k => `var(--${SOURCE_SLOT[k] || 'other'})`;
+const srcName = k => SOURCE_NAME[k] || k;
+// "anthropic#work" = one of several accounts of a provider
+const pName = p => { const [b, acct] = String(p).split('#'); const n = PROVIDER_NAME[b] || b; return acct ? `${n} · ${acct}` : n; };
+
+// Status: reserved colors, always with icon + label.
+const ICONS = {
+  good: 'M20 6 9 17l-5-5', warn: 'M12 8v5M12 16.5v.5', critical: 'M18 6 6 18M6 6l12 12', run: 'M12 3a9 9 0 1 0 9 9', idle: 'M5 12h14',
+};
+const STATUS = {
+  running: ['çalışıyor', 'good', 'run'], ok: ['aktif', 'good', 'good'], done: ['bitti', 'muted', 'good'], agent_close: ['bitti', 'muted', 'good'],
+  ended: ['bitti', 'muted', 'good'], blocked: ['bloklu', 'warn', 'warn'], exhausted: ['limit doldu', 'critical', 'critical'],
+  interrupted: ['kesildi', 'serious', 'warn'], failed: ['hata', 'critical', 'critical'], error: ['hata', 'critical', 'critical'],
+  ready: ['hazır', 'muted', 'idle'], todo: ['yapılacak', 'muted', 'idle'], triage: ['triage', 'muted', 'idle'], idle: ['boşta', 'muted', 'idle'],
+};
+function statusEl(key) {
+  const k = String(key || '').toLowerCase();
+  const [label, tone, icon] = STATUS[k] || [k || '—', /fail|error|revok/.test(k) ? 'critical' : /limit|exhaust/.test(k) ? 'critical' : 'muted', 'idle'];
+  const color = tone === 'muted' ? 'var(--muted)' : `var(--${tone})`;
+  const svg = s('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: color, 'stroke-width': 3, 'stroke-linecap': 'round' }, s('path', { d: ICONS[icon] }));
+  if (icon === 'run') svg.innerHTML = '<circle cx="12" cy="12" r="5" fill="' + color + '" stroke="none"/>';
+  return h('span', { class: 'status' }, svg, label);
+}
+
+// ---------- tooltip ----------
+const tip = $('tip');
+function showTip(ev, title, rows) {
+  tip.replaceChildren(h('div', { class: 't' }, title), ...rows.map(r =>
+    h('div', { class: 'r' }, h('span', {}, r.color ? h('i', { style: `background:${r.color}` }) : null, r.label), h('b', {}, r.value))));
+  tip.style.display = 'block';
+  const x = Math.min(ev.clientX + 14, innerWidth - tip.offsetWidth - 8);
+  const y = Math.min(ev.clientY + 14, innerHeight - tip.offsetHeight - 8);
+  tip.style.left = x + 'px'; tip.style.top = y + 'px';
+}
+const hideTip = () => { tip.style.display = 'none'; };
+
+// ---------- charts (hand-rolled SVG) ----------
+function niceMax(v) {
+  if (!v || v <= 0) return 1;
+  const p = Math.pow(10, Math.floor(Math.log10(v)));
+  for (const m of [1, 2, 2.5, 5, 10]) if (m * p >= v) return m * p;
+  return 10 * p;
+}
+function legend(series, kind = 'rect') {
+  if (series.length < 2) return null;
+  return h('div', { class: 'legend' }, series.map(se => h('span', {}, h('i', { class: kind === 'line' ? 'line' : '', style: `background:${se.color}` }), se.label)));
+}
+
+const widthCache = {};
+function responsive(height, draw, key) {
+  const box = h('div', { style: `height:${height}px;position:relative` });
+  let lastW = 0;
+  const paint = () => {
+    const w = Math.round(box.clientWidth);
+    if (!w || w === lastW) return;
+    lastW = w;
+    if (key) widthCache[key] = w;
+    box.replaceChildren(draw(w));
+  };
+  // periodic re-renders (live page) draw immediately at the last known width: no empty frame
+  if (key && widthCache[key]) { lastW = widthCache[key]; box.append(draw(lastW)); }
+  new ResizeObserver(paint).observe(box);
+  requestAnimationFrame(paint);
+  return box;
+}
+
+/** Vertical stacked bars. cols: [{label, tipTitle, values:{key:number}}], series: [{key,label,color}] */
+function barChart(cols, series, opts = {}) {
+  return responsive(opts.height || 190, w => barChartSvg(w, cols, series, opts), opts.key);
+}
+function barChartSvg(W, cols, series, { height = 190, fmt = fmtN, labelEvery } = {}) {
+  const H = height, L = 48, R = 6, T = 8, B = 22;
+  const totals = cols.map(c => series.reduce((a, se) => a + (c.values[se.key] || 0), 0));
+  const max = niceMax(Math.max(...totals, 0));
+  const pw = W - L - R, ph = H - T - B, bw = pw / Math.max(cols.length, 1);
+  const gap = Math.min(2, bw * .25), barW = Math.max(1, bw - Math.max(2, bw * .28));
+  const svg = s('svg', { class: 'chart', width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+  for (let i = 0; i <= 4; i++) {
+    const y = T + ph - ph * i / 4;
+    svg.append(s('line', { class: i ? 'gridline' : 'axis', x1: L, x2: W - R, y1: y, y2: y }));
+    svg.append(s('text', { x: L - 6, y: y + 3.5, 'text-anchor': 'end' }, document.createTextNode(fmt(max * i / 4))));
+  }
+  // at most one x label per ~64px
+  const every = Math.max(labelEvery || 1, Math.ceil(cols.length / Math.max(1, Math.floor(pw / 64))));
+  cols.forEach((c, i) => {
+    const x = L + i * bw + (bw - barW) / 2;
+    let y = T + ph;
+    const g = s('g');
+    series.forEach((se, si) => {
+      const v = c.values[se.key] || 0;
+      if (!v) return;
+      const hgt = ph * v / max;
+      const top = si === series.length - 1 || !series.slice(si + 1).some(n => c.values[n.key]);
+      const segH = Math.max(0, hgt - (top ? 0 : gap));
+      const rr = top ? Math.min(4, barW / 2, segH) : 0;
+      y -= hgt;
+      const yy = y + (top ? 0 : gap);
+      const path = rr
+        ? `M${x},${yy + segH} V${yy + rr} Q${x},${yy} ${x + rr},${yy} H${x + barW - rr} Q${x + barW},${yy} ${x + barW},${yy + rr} V${yy + segH} Z`
+        : `M${x},${yy + segH} V${yy} H${x + barW} V${yy + segH} Z`;
+      g.append(s('path', { d: path, fill: se.color }));
+    });
+    const band = s('rect', { class: 'hover-band', x: L + i * bw, y: T, width: bw, height: ph, opacity: 0 });
+    const hit = s('rect', { class: 'hit', x: L + i * bw, y: T, width: bw, height: ph + B, tabindex: 0 });
+    const show = ev => {
+      band.setAttribute('opacity', 1);
+      const rows = series.filter(se => c.values[se.key]).map(se => ({ label: se.label, value: fmt(c.values[se.key]), color: se.color })).reverse();
+      if (series.length > 1) rows.push({ label: 'Toplam', value: fmt(totals[i]) });
+      showTip(ev.clientX ? ev : { clientX: hit.getBoundingClientRect().x, clientY: hit.getBoundingClientRect().y }, c.tipTitle || c.label, rows.length ? rows : [{ label: '—', value: fmt(0) }]);
+    };
+    hit.addEventListener('pointermove', show); hit.addEventListener('focus', show);
+    const hide = () => { band.setAttribute('opacity', 0); hideTip(); };
+    hit.addEventListener('pointerleave', hide); hit.addEventListener('blur', hide);
+    svg.append(band, g);
+    if (i % every === 0 || i === cols.length - 1 && cols.length < 16)
+      svg.append(s('text', { x: L + i * bw + bw / 2, y: H - 6, 'text-anchor': 'middle' }, document.createTextNode(c.label)));
+    svg.append(hit);
+  });
+  return svg;
+}
+
+/** Line chart with fixed 0-100 y (quota %). series: [{label,color,points:[[t,v]]}] */
+function lineChart(series, opts = {}) {
+  return responsive(opts.height || 200, w => lineChartSvg(w, series, opts));
+}
+function lineChartSvg(W, series, { height = 200, yMax = 100, fmt = v => '%' + Math.round(v), t0, t1 } = {}) {
+  const H = height, L = 40, R = 8, T = 8, B = 22, pw = W - L - R, ph = H - T - B;
+  const all = series.flatMap(se => se.points.map(p => p[0]));
+  t0 = t0 ?? Math.min(...all); t1 = t1 ?? Math.max(...all);
+  if (!(t1 > t0)) t1 = t0 + 3600;
+  const X = t => L + pw * (t - t0) / (t1 - t0), Y = v => T + ph - ph * v / yMax;
+  const svg = s('svg', { class: 'chart', width: W, height: H, viewBox: `0 0 ${W} ${H}` });
+  for (let i = 0; i <= 4; i++) {
+    const y = T + ph - ph * i / 4;
+    svg.append(s('line', { class: i ? 'gridline' : 'axis', x1: L, x2: W - R, y1: y, y2: y }));
+    svg.append(s('text', { x: L - 6, y: y + 3.5, 'text-anchor': 'end' }, document.createTextNode(fmt(yMax * i / 4))));
+  }
+  const span = t1 - t0, multiDay = span > 86400 * 1.5;
+  for (let i = 0; i <= 5; i++) {
+    const t = t0 + span * i / 5;
+    const lbl = multiDay ? new Date(t * 1000).toLocaleDateString('tr-TR', { day: 'numeric', month: 'short' }) : timeLabel(t);
+    svg.append(s('text', { x: X(t), y: H - 6, 'text-anchor': i === 0 ? 'start' : i === 5 ? 'end' : 'middle' }, document.createTextNode(lbl)));
+  }
+  series.forEach(se => {
+    if (!se.points.length) return;
+    const d = se.points.map((p, i) => (i ? 'L' : 'M') + X(p[0]).toFixed(1) + ',' + Y(p[1]).toFixed(1)).join(' ');
+    svg.append(s('path', { d, fill: 'none', stroke: se.color, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }));
+  });
+  const cross = s('line', { x1: 0, x2: 0, y1: T, y2: T + ph, stroke: 'var(--muted)', 'stroke-width': 1, opacity: 0, 'vector-effect': 'non-scaling-stroke' });
+  const hit = s('rect', { class: 'hit', x: L, y: T, width: pw, height: ph });
+  hit.addEventListener('pointermove', ev => {
+    const r = svg.getBoundingClientRect();
+    const tt = t0 + (ev.clientX - r.left - L) / pw * (t1 - t0);
+    const rows = series.map(se => {
+      let best = null;
+      for (const p of se.points) if (!best || Math.abs(p[0] - tt) < Math.abs(best[0] - tt)) best = p;
+      return best && { label: se.label, value: fmt(best[1]), color: se.color, t: best[0] };
+    }).filter(Boolean);
+    if (!rows.length) return;
+    const x = X(rows[0].t);
+    cross.setAttribute('x1', x); cross.setAttribute('x2', x); cross.setAttribute('opacity', 1);
+    showTip(ev, new Date(rows[0].t * 1000).toLocaleString('tr-TR', { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' }), rows);
+  });
+  hit.addEventListener('pointerleave', () => { cross.setAttribute('opacity', 0); hideTip(); });
+  svg.append(cross, hit);
+  return svg;
+}
+
+/** Horizontal ranked bars, single hue. rows: [{label, value, sub}] */
+function hBars(rows, { fmt = fmtN, color = 'var(--s1)', max: n = 10 } = {}) {
+  rows = rows.filter(r => r.value > 0).slice(0, n);
+  if (!rows.length) return h('div', { class: 'empty' }, 'Bu aralıkta veri yok.');
+  const max = Math.max(...rows.map(r => r.value));
+  return h('div', { style: 'display:grid;gap:8px' }, rows.map(r => {
+    const row = h('div', {},
+      h('div', { style: 'display:flex;justify-content:space-between;gap:8px;font-size:12.5px' },
+        h('span', { style: 'overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.label, r.sub ? h('span', { class: 'sub' }, ' · ' + r.sub) : null),
+        h('b', { style: 'font-variant-numeric:tabular-nums;font-weight:600' }, fmt(r.value))),
+      h('div', { class: 'track', style: 'height:6px;margin-top:4px' }, h('div', { class: 'fill', style: `width:${100 * r.value / max}%;background:${r.color || color}` })));
+    return row;
+  }));
+}
+
+/** 100% share bar. parts: [{label, value, color}] */
+function shareBar(parts, fmt = fmtN) {
+  parts = parts.filter(p => p.value > 0);
+  const total = parts.reduce((a, p) => a + p.value, 0);
+  if (!total) return h('div', { class: 'empty' }, 'Veri yok.');
+  const bar = h('div', { style: 'display:flex;height:14px;border-radius:5px;overflow:hidden;gap:2px;background:var(--surface)' },
+    parts.map(p => {
+      const seg = h('div', { style: `flex:${p.value} 0 0;background:${p.color}`, tabindex: 0 });
+      seg.addEventListener('pointermove', ev => showTip(ev, p.label, [{ label: 'Pay', value: '%' + (100 * p.value / total).toFixed(1) }, { label: 'Miktar', value: fmt(p.value) }]));
+      seg.addEventListener('pointerleave', hideTip);
+      return seg;
+    }));
+  const lg = h('div', { class: 'legend', style: 'margin:10px 0 0' }, parts.map(p =>
+    h('span', {}, h('i', { style: `background:${p.color}` }), p.label + ' ', h('b', { style: 'color:var(--text)' }, '%' + (100 * p.value / total).toFixed(0)))));
+  return h('div', {}, bar, lg);
+}
+
+function sparkline(values, color = 'var(--s1)') {
+  const W = 96, H = 24, max = Math.max(...values, 1);
+  const pts = values.map((v, i) => `${(i / Math.max(values.length - 1, 1) * W).toFixed(1)},${(H - 2 - (H - 4) * v / max).toFixed(1)}`);
+  return s('svg', { class: 'spark', width: W, height: H, viewBox: `0 0 ${W} ${H}` },
+    s('polyline', { points: pts.join(' '), fill: 'none', stroke: color, 'stroke-width': 1.6, 'stroke-linejoin': 'round' }));
+}
+
+function table(cols, rows) {
+  return h('div', { class: 'scroll' }, h('table', {},
+    h('thead', {}, h('tr', {}, cols.map(c => h('th', { class: c.n ? 'n' : '' }, c.label)))),
+    h('tbody', {}, rows.length ? rows.map(r => h('tr', {}, cols.map(c => h('td', { class: c.n ? 'n' : '' }, c.get(r)))))
+      : h('tr', {}, h('td', { colspan: cols.length, class: 'empty' }, 'Veri yok.')))));
+}
+
+/** Card with an optional chart/table toggle (table view is the accessible fallback). */
+function card(title, sub, body, { tableView, cls = '' } = {}) {
+  const content = h('div', {}, body);
+  let showingTable = false;
+  const tools = tableView ? h('div', { class: 'tools' }, h('button', {
+    class: 'link', onclick: ev => {
+      showingTable = !showingTable;
+      content.replaceChildren(showingTable ? tableView() : body);
+      ev.target.textContent = showingTable ? 'Grafik' : 'Tablo';
+    }
+  }, 'Tablo')) : null;
+  return h('div', { class: 'card ' + cls }, h('div', { class: 'card-h' }, h('h3', {}, title), sub ? h('span', { class: 'sub' }, sub) : null, tools), content);
+}
+const kpi = (label, value, hint) => h('div', { class: 'card kpi' }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value), hint ? h('div', { class: 'hint' }, hint) : null);
+
+function gauge(w) {
+  const p = w.used == null ? null : Math.max(0, Math.min(100, w.used));
+  const tone = p == null ? 'var(--muted)' : p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
+  return h('div', { class: 'gauge' },
+    h('div', { class: 'row' }, h('span', {}, w.label), h('b', {}, p == null ? '—' : fmtPct(p) + ' kullanıldı')),
+    h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })),
+    h('div', { class: 'sub', style: 'font-size:11.5px' }, [until(w.reset), w.detail].filter(Boolean).join(' · ')));
+}
+
+function quotaCard(it, burn = []) {
+  const kids = [];
+  it.windows.forEach(w => {
+    kids.push(gauge(w));
+    const b = burn.find(x => x.provider === it.provider && x.window === w.label);
+    if (b && b.per_hour > 0.01) kids.push(h('div', { class: 'note', style: 'margin-top:0' },
+      `Saatte +%${b.per_hour.toFixed(1)}` + (b.eta_full ? ` · bu hızla ${new Date(b.eta_full * 1000).toLocaleString('tr-TR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })} dolar` : '')));
+  });
+  it.details.forEach(d => kids.push(h('div', { class: 'note' }, d)));
+  if (it.unavailable) kids.push(h('div', { class: 'note' }, it.unavailable));
+  if (!it.windows.length && !it.details.length && !it.unavailable) {
+    const exhausted = it.accounts.some(a => a.status === 'exhausted');
+    kids.push(h('div', { class: 'note' }, exhausted ? 'Limit dolu olduğu için kota bilgisi alınamıyor.' : 'Bu sağlayıcı kota bilgisi vermiyor.'));
+  }
+  it.accounts.forEach((a, i) => kids.push(h('div', { class: 'acct', style: i === 0 ? 'margin-top:10px' : '' },
+    h('span', {}, a.label || a.source), h('span', { style: 'display:flex;gap:10px;align-items:center' }, h('span', { class: 'sub' }, fmtN(a.requests) + ' istek'), statusEl(a.status || 'ok')))));
+  return h('div', { class: 'card' },
+    h('div', { class: 'card-h' }, h('i', { style: `width:10px;height:10px;border-radius:3px;background:${pColor(it.provider)};display:inline-block` }),
+      h('h3', {}, pName(it.provider)), h('span', { class: 'sub' }, [it.plan, it.accounts.length + ' hesap'].filter(Boolean).join(' · '))), ...kids);
+}
+
+// ---------- filters ----------
+const FILTERS = {
+  live: ['q', 'source', 'status'], overview: ['provider'], accounts: ['provider'], agents: ['q', 'provider', 'status'],
+  subagents: ['q', 'model', 'status'], clis: ['q', 'source', 'model', 'status'], kanban: ['q', 'status'],
+};
+const F_ALL = { source: 'Tüm kaynaklar', provider: 'Tüm sağlayıcılar', model: 'Tüm modeller', status: 'Tüm durumlar' };
+const flt = store.get('filters', { q: '', source: '', provider: '', model: '', status: '' });
+const lastData = {};
+let lastLive = null;
+const fOn = k => (FILTERS[state.page] || []).includes(k) && flt[k];
+const fMatch = (...fields) => !fOn('q') || fields.some(v => String(v ?? '').toLocaleLowerCase('tr').includes(flt.q.toLocaleLowerCase('tr').trim()));
+const fIs = (k, v) => !fOn(k) || String(v ?? '') === flt[k];
+
+/** Called by renderers: fill a select with the values present in the current data. */
+function fOptions(key, values, label = x => x) {
+  const sel = $('f-' + key);
+  const vals = [...new Set(values.filter(v => v != null && v !== ''))].sort((a, b) => String(label(a)).localeCompare(String(label(b)), 'tr'));
+  if (flt[key] && !vals.includes(flt[key])) vals.unshift(flt[key]);
+  const sig = vals.join('|');
+  if (sel.dataset.sig === sig) return;
+  sel.dataset.sig = sig;
+  sel.replaceChildren(h('option', { value: '' }, F_ALL[key]), ...vals.map(v => h('option', { value: v }, label(v))));
+  sel.value = flt[key] || '';
+}
+function fCount(shown, total, noun = 'sonuç') {
+  $('f-count').textContent = shown === total ? `${total} ${noun}` : `${shown} / ${total} ${noun}`;
+}
+function syncFilters() {
+  const keys = FILTERS[state.page] || [];
+  $('filters').classList.toggle('show', keys.length > 0);
+  ['q', 'source', 'provider', 'model', 'status'].forEach(k => {
+    const el = $('f-' + k);
+    (k === 'q' ? el.parentElement : el).style.display = keys.includes(k) ? '' : 'none';
+    el.classList.toggle('active', !!flt[k] && keys.includes(k));
+    if (k !== 'q' && el.value !== (flt[k] || '')) el.value = flt[k] || '';
+  });
+  $('f-q').value = flt.q;
+  $('f-clear').classList.toggle('show', keys.some(k => flt[k]));
+  $('f-count').textContent = '';
+}
+function setFilter(k, v) {
+  flt[k] = v; store.set('filters', flt); syncFilters(); rerender();
+}
+function rerender() {
+  if (state.page === 'live') { if (lastLive) renderLive(lastLive); return; }
+  const d = lastData[state.page];
+  if (d) $('p-' + state.page).replaceChildren(RENDERERS[state.page](d));
+}
+function buildFilters() {
+  let t;
+  $('f-q').addEventListener('input', ev => { clearTimeout(t); t = setTimeout(() => setFilter('q', ev.target.value), 150); });
+  ['source', 'provider', 'model', 'status'].forEach(k => $('f-' + k).addEventListener('change', ev => setFilter(k, ev.target.value)));
+  $('f-clear').addEventListener('click', () => { (FILTERS[state.page] || []).forEach(k => flt[k] = ''); store.set('filters', flt); syncFilters(); rerender(); });
+  Object.keys(F_ALL).forEach(k => fOptions(k, []));
+}
+const STATUS_LABEL = v => (STATUS[v] || [v])[0];
+
+// ---------- state & routing ----------
+const PAGES = [
+  { id: 'live', title: 'Canlı', icon: 'M3 12h4l3-8 4 16 3-8h4', live: true },
+  { id: 'overview', title: 'Özet', icon: 'M4 20V10M10 20V4M16 20v-7M22 20H2' },
+  { id: 'accounts', title: 'Hesaplar & Kotalar', icon: 'M3 7h18v12H3zM3 11h18M7 15h3' },
+  { id: 'agents', title: 'Ajanlar', icon: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0' },
+  { id: 'subagents', title: 'Alt Ajanlar', icon: 'M6 3v6a3 3 0 0 0 3 3h6M6 9v12M15 12l3 3-3 3' },
+  { id: 'clis', title: 'CLI Ajanları', icon: 'M4 17l6-5-6-5M12 19h8' },
+  { id: 'kanban', title: 'Kartlar', icon: 'M4 4h5v16H4zM10 4h5v10h-5zM16 4h4v7h-4z' },
+];
+const RANGES = [['today', 'Bugün', 0], ['7', '7 gün', 6], ['30', '30 gün', 29], ['90', '90 gün', 89], ['custom', 'Özel', null]];
+const iso = d => d.toLocaleDateString('sv-SE');
+let state = { page: store.get('page', 'live'), range: store.get('range', '7'), from: store.get('from', null), to: store.get('to', null), profile: store.get('profile', '') };
+let lastLiveOk = 0, liveTimer = null, pageTimer = null, prevTokens = {};
+
+function rangeDates() {
+  const r = RANGES.find(x => x[0] === state.range);
+  if (r && r[2] != null) { const to = new Date(); const from = new Date(); from.setDate(to.getDate() - r[2]); return [iso(from), iso(to)]; }
+  return [state.from || iso(new Date(Date.now() - 6 * 864e5)), state.to || iso(new Date())];
+}
+const qs = () => { const [f, t] = rangeDates(); return `from=${f}&to=${t}` + (state.profile ? `&profile=${encodeURIComponent(state.profile)}` : ''); };
+
+function buildChrome() {
+  const nav = $('nav');
+  PAGES.forEach(p => nav.append(h('a', { href: '#' + p.id, id: 'nav-' + p.id, onclick: ev => { ev.preventDefault(); go(p.id); } },
+    s('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: 'currentColor', 'stroke-width': 2, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }, s('path', { d: p.icon })),
+    p.title, p.id === 'live' ? h('span', { class: 'badge', id: 'badge-live' }, '0') : null)));
+  nav.append(h('div', { class: 'side', id: 'side' }));
+  nav.append(h('div', { class: 'foot' },
+    h('div', {}, h('span', { class: 'live-dot pulse', id: 'dot' }), ' ', h('span', { id: 'conn' }, 'bağlanıyor…')),
+    h('div', {}, 'Salt-okuma · 127.0.0.1:8777')));
+  const seg = $('ranges');
+  RANGES.forEach(([id, label]) => seg.append(h('button', { 'data-r': id, onclick: () => { state.range = id; store.set('range', id); syncControls(); reload(); } }, label)));
+  const [f, t] = rangeDates();
+  $('from').value = f; $('to').value = t;
+  $('from').onchange = $('to').onchange = () => { state.from = $('from').value; state.to = $('to').value; store.set('from', state.from); store.set('to', state.to); reload(); };
+  $('profile').onchange = () => { state.profile = $('profile').value; store.set('profile', state.profile); reload(); };
+  addEventListener('hashchange', () => { const id = location.hash.slice(1); if (PAGES.some(p => p.id === id) && id !== state.page) go(id); });
+}
+function syncControls() {
+  document.querySelectorAll('#ranges button').forEach(b => b.classList.toggle('on', b.dataset.r === state.range));
+  $('custom').classList.toggle('show', state.range === 'custom');
+  const live = PAGES.find(p => p.id === state.page).live;
+  $('ranges').style.display = live ? 'none' : ''; $('custom').style.display = live ? 'none' : '';
+  $('profile').style.display = live ? 'none' : '';
+}
+function go(id) {
+  state.page = id; store.set('page', id);
+  if (location.hash.slice(1) !== id) history.replaceState(null, '', '#' + id);
+  PAGES.forEach(p => { $('p-' + p.id).classList.toggle('on', p.id === id); $('nav-' + p.id).classList.toggle('on', p.id === id); });
+  $('title').textContent = PAGES.find(p => p.id === id).title;
+  syncControls(); syncFilters(); reload();
+}
+function reload() {
+  clearInterval(pageTimer);
+  if (state.page !== 'live') { loadPage(); pageTimer = setInterval(loadPage, 30000); }
+  else loadLive();
+}
+
+async function api(path, extra = '') {
+  const r = await fetch(`/api/${path}?${qs()}${extra}`);
+  if (!r.ok) throw new Error((await r.json().catch(() => ({}))).error || r.status);
+  return r.json();
+}
+
+function fillProfiles(names) {
+  const sel = $('profile');
+  if (sel.options.length > 1) return;
+  names.forEach(n => sel.append(h('option', { value: n }, n)));
+  sel.value = state.profile;
+}
+
+// ---------- live (polls every 1.5 s) ----------
+async function loadLive() {
+  clearTimeout(liveTimer);
+  try {
+    const d = await (await fetch('/api/live')).json();
+    lastLiveOk = Date.now();
+    lastLive = d;
+    renderLive(d);
+    renderSide(d);
+    $('badge-live').textContent = d.running.filter(r => r.status === 'running').length;
+  } catch (e) {
+    if (state.page === 'live') $('meta').textContent = 'bağlantı yok — panel.py çalışıyor mu?';
+  }
+  liveTimer = setTimeout(loadLive, state.page === 'live' ? 1500 : 2000);
+}
+setInterval(() => {
+  const stale = Date.now() - lastLiveOk > 6000;
+  $('dot').classList.toggle('stale', stale); $('dot').classList.toggle('pulse', !stale);
+  $('conn').textContent = stale ? 'bağlantı yok' : 'canlı · 1,5 sn';
+}, 1000);
+
+function renderSide(d) {
+  const side = $('side');
+  if (!side) return;
+  const parts = [];
+
+  // quotas
+  const items = (d.quotas.items || []);
+  const wins = items.flatMap(it => it.windows.map(w => ({ ...w, provider: it.provider })));
+  const bad = items.filter(it => it.accounts.some(a => a.status === 'exhausted'));
+  if (wins.length || bad.length) {
+    parts.push(h('div', {}, h('h5', {}, 'Kotalar', d.quotas.fetched_at ? h('span', {}, ago(d.quotas.fetched_at)) : null),
+      wins.map(w => {
+        const p = Math.max(0, Math.min(100, w.used || 0));
+        const tone = p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
+        const short = { 'Current session': 'Oturum', 'Current day': 'Gün', 'Current week': 'Hafta', 'Current month': 'Ay', 'Premium requests': 'Premium istek', 'Opus week': 'Opus hafta', 'Sonnet week': 'Sonnet hafta' }[w.label] || w.label;
+        return h('div', { class: 'sq', title: `${pName(w.provider)} · ${w.label}` },
+          h('div', { class: 'r' }, h('span', {}, pName(w.provider).split(' ')[0] + (String(w.provider).includes('#') ? ' ' + String(w.provider).split('#')[1] : '') + ' · ' + short), h('b', {}, fmtPct(p))),
+          h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p}%;background:${tone}` })),
+          h('div', { class: 'sub' }, until(w.reset)));
+      }),
+      bad.map(it => h('div', { class: 'sbad' }, h('i'), pName(it.provider) + ' · limit doldu'))));
+  }
+
+  // tokens right now + 30-min sparkline
+  const perMin = d.tokens.map(m => Object.values(m.by).reduce((a, v) => a + v.tokens, 0));
+  parts.push(h('div', {}, h('h5', {}, 'Şu an', h('span', {}, 'token / dk')),
+    h('div', { class: 'sbig' }, h('b', {}, fmtN(d.last_1m)), h('span', {}, 'son 1 dk')),
+    h('div', { class: 'sub', style: 'font-size:11px' }, `son 60 dk: ${fmtN(d.last_60m)} · ${fmtUsd(d.cost_60m)}`),
+    h('div', { style: 'margin-top:6px' }, sparkBars(perMin.slice(-30)))));
+
+  // running sessions
+  const run = d.running.filter(r => r.status === 'running');
+  const now = d.now;
+  parts.push(h('div', {}, h('h5', {}, 'Çalışanlar', h('span', {}, String(run.length))),
+    run.length ? h('div', { class: 'srun' }, run.slice(0, 6).map(r => h('a', { href: '#live', onclick: ev => { ev.preventDefault(); go('live'); } },
+      h('span', { class: 'd live-dot pulse', style: `background:${r.source ? srcColor(r.source) : 'var(--good)'}` }),
+      h('span', { class: 't' }, (r.subagent ? '↳ ' : '') + (r.profile || ''), h('small', {}, r.title || r.activity || '—')),
+      h('span', { class: 'e' }, dur(now - (r.started || now)).replace(/ \d+ sn$/, '')))))
+      : h('div', { class: 'sub', style: 'font-size:11.5px' }, 'Şu an çalışan yok.')));
+
+  // source share, last 60 min
+  const src = Object.entries(d.by_source_60m || {}).filter(([, v]) => v > 0);
+  const tot = src.reduce((a, [, v]) => a + v, 0);
+  if (tot) parts.push(h('div', {}, h('h5', {}, 'Son 60 dk'),
+    h('div', { class: 'ssrc' }, src.map(([k, v]) => h('div', { style: `flex:${v} 0 0;background:${srcColor(k)}` }))),
+    h('div', { class: 'slg' }, src.map(([k, v]) => h('div', {}, h('span', {}, h('i', { style: `background:${srcColor(k)}` }), srcName(k)), h('b', {}, fmtN(v)))))));
+
+  side.replaceChildren(...parts);
+}
+
+function sparkBars(values) {
+  const W = 176, H = 30, n = values.length || 1, bw = W / n, max = Math.max(...values, 1);
+  return s('svg', { width: '100%', height: H, viewBox: `0 0 ${W} ${H}`, preserveAspectRatio: 'none', style: 'display:block' },
+    values.map((v, i) => {
+      const hh = v ? Math.max(2, (H - 2) * v / max) : 1;
+      return s('rect', { x: (i * bw + .5).toFixed(1), y: (H - hh).toFixed(1), width: Math.max(1, bw - 1.5).toFixed(1), height: hh.toFixed(1), rx: 1,
+        fill: v ? 'var(--accent)' : 'var(--line)' });
+    }));
+}
+
+function renderLive(d) {
+  if (state.page !== 'live') return;
+  const page = $('p-live');
+  const running = d.running.filter(r => r.status === 'running');
+  const runSubs = running.filter(r => r.subagent);
+  const warming = !d.sampling_since || d.now - d.sampling_since < 3600;
+  const warmMin = d.sampling_since ? Math.floor((d.now - d.sampling_since) / 60) : 0;
+  $('meta').textContent = 'güncellendi ' + new Date().toLocaleTimeString('tr-TR');
+
+  const kpis = h('div', { class: 'grid g-kpi' },
+    kpi('Son 1 dk', fmtN(d.last_1m) + ' token'),
+    kpi('Son 5 dk', fmtN(d.last_5m) + ' token'),
+    kpi('Son 60 dk', fmtN(d.last_60m) + ' token', Object.entries(d.by_source_60m || {}).filter(([, v]) => v).map(([k, v]) => `${srcName(k)} ${fmtN(v)}`).join(' · ') || (warming ? `Hermes ölçümü ${warmMin} dk önce başladı` : null)),
+    kpi('Son 60 dk maliyet', fmtUsd(d.cost_60m), 'tahmini API karşılığı'),
+    kpi('Çalışan oturum', String(running.length - runSubs.length)),
+    kpi('Çalışan alt ajan', String(runSubs.length)));
+
+  const provs = d.providers.length ? d.providers : [];
+  const series = provs.map(p => ({ key: p, label: srcName(p), color: srcColor(p) }));
+  const tokCols = d.tokens.map(m => ({ label: timeLabel(m.t), tipTitle: timeLabel(m.t), values: Object.fromEntries(Object.entries(m.by).map(([k, v]) => [k, v.tokens])) }));
+  const tokCard = card('Token / dakika', 'son 60 dk · kaynağa göre',
+    [legend(series), provs.length ? barChart(tokCols, series, { height: 170, labelEvery: 10, key: 'live-tok' }) : h('div', { class: 'empty' }, warming ? 'Ölçüm yeni başladı; token akışı birkaç saniye içinde görünecek.' : 'Son 60 dakikada token tüketimi yok.')],
+    { tableView: () => table([{ label: 'Dakika', get: r => timeLabel(r.t) }, ...provs.map(p => ({ label: srcName(p), n: 1, get: r => fmtN(r.by[p]?.tokens) }))], d.tokens.filter(m => Object.keys(m.by).length).reverse()) });
+
+  const actSeries = [{ key: 'assistant', label: 'Model yanıtı', color: 'var(--s1)' }, { key: 'tool', label: 'Araç çağrısı', color: 'var(--s2)' }];
+  const actCols = d.activity.map(m => ({ label: timeLabel(m.t), tipTitle: timeLabel(m.t), values: { assistant: m.assistant, tool: m.tool } }));
+  const actCard = card('Aktivite / dakika', 'son 60 dk · mesaj sayısı',
+    [legend(actSeries), barChart(actCols, actSeries, { height: 170, labelEvery: 10, key: 'live-act', fmt: v => nfi.format(Math.round(v)) })],
+    { tableView: () => table([{ label: 'Dakika', get: r => timeLabel(r.t) }, { label: 'Model yanıtı', n: 1, get: r => r.assistant }, { label: 'Araç çağrısı', n: 1, get: r => r.tool }], d.activity.filter(m => m.assistant || m.tool).reverse()) });
+
+  const quotaItems = (d.quotas.items || []).filter(it => it.windows.length || it.accounts.some(a => a.status === 'exhausted'));
+  const quotaCardEl = card('Kotalar', d.quotas.fetched_at ? 'çekildi ' + ago(d.quotas.fetched_at) : '',
+    h('div', { class: 'grid g3' }, quotaItems.map(it => quotaCard(it, d.burn))));
+
+  // filters: source / status / search
+  const liveSrc = r => r.source || 'hermes';
+  fOptions('source', d.running.map(liveSrc), srcName);
+  fOptions('status', ['running', 'done'], STATUS_LABEL);
+  const keep = r => fIs('source', liveSrc(r)) && (!fOn('status') || (flt.status === 'running') === (r.status === 'running'))
+    && fMatch(r.title, r.profile, r.model, r.activity, r.parent_title);
+  const allCount = d.running.length;
+  // subagent tree: roots = running non-subagents; children grouped by parent
+  const byParent = {};
+  d.running.filter(r => r.subagent && keep(r)).forEach(r => (byParent[r.parent] ||= []).push(r));
+  const roots = d.running.filter(r => !r.subagent && (keep(r) || byParent[r.id]));
+  Object.keys(byParent).forEach(pid => { if (!roots.some(r => r.id === pid)) roots.push({ id: pid, orphan: true, title: byParent[pid][0].parent_title, profile: byParent[pid][0].profile, status: 'idle' }); });
+  roots.sort((a, b) => (b.status === 'running') - (a.status === 'running') || (b.last || 0) - (a.last || 0));
+  if ((FILTERS.live || []).some(k => flt[k])) fCount(roots.filter(r => !r.orphan).length + Object.values(byParent).flat().length, allCount, 'oturum');
+  const node = (r, child) => {
+    const key = r.id, flash = prevTokens[key] != null && r.tokens > prevTokens[key];
+    prevTokens[key] = r.tokens;
+    const elapsed = r.started ? (r.status === 'running' ? d.now - r.started : (r.last || d.now) - r.started) : null;
+    return h('div', { class: child ? 'child' : '' },
+      h('div', { class: 'head' }, statusEl(r.status), h('span', { class: 'title' }, r.title || '(başlıksız oturum)'),
+        h('span', { class: 'chip', style: r.source ? `color:${srcColor(r.source)};font-weight:600` : '' }, r.profile), r.model ? h('span', { class: 'chip' }, r.model) : null),
+      r.orphan ? h('div', { class: 'meta' }, 'ana oturum şu an boşta') : h('div', { class: 'meta' },
+        h('span', {}, h('b', { class: flash ? 'flash' : '' }, fmtN(r.tokens)), ' token'),
+        h('span', {}, h('b', {}, fmtUsd(r.cost))),
+        h('span', {}, h('b', {}, nfi.format(r.tools || 0)), r.source ? ' model çağrısı' : ' araç'),
+        h('span', {}, 'süre ', h('b', {}, dur(elapsed))),
+        h('span', {}, 'son ', ago(r.last))),
+      r.activity ? h('div', { class: 'act', title: r.activity }, '↳ ' + r.activity) : null);
+  };
+  const tree = roots.length ? h('div', { class: 'tree' }, roots.map(r => h('div', { class: 'node root' }, node(r),
+    byParent[r.id] ? h('div', { class: 'children' }, byParent[r.id].sort((a, b) => (b.status === 'running') - (a.status === 'running') || (b.last || 0) - (a.last || 0)).map(c => node(c, true))) : null)))
+    : h('div', { class: 'empty' }, (FILTERS.live || []).some(k => flt[k]) ? 'Filtreye uyan oturum yok.' : 'Şu an çalışan oturum yok.');
+  const treeCard = card('Çalışan oturumlar ve alt ajanlar', `${running.length} çalışıyor · son 15 dk'da biten alt ajanlar dahil`, tree);
+
+  const byProf = card('Ajan bazında tüketim', 'son 60 dk', hBars(d.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) }))));
+
+  page.replaceChildren(h('div', { class: 'stack' }, kpis, treeCard, h('div', { class: 'grid g2' }, tokCard, actCard), quotaCardEl, byProf));
+}
+
+// ---------- range pages ----------
+async function loadPage() {
+  const id = state.page;
+  const page = $('p-' + id);
+  page.classList.add('updating');
+  try {
+    const data = await api(id === 'overview' ? 'overview' : id);
+    if (state.page !== id) return;
+    lastData[id] = data;
+    const [f, t] = rangeDates();
+    $('meta').textContent = `${dayLabel(f)} – ${dayLabel(t)} · güncellendi ${new Date().toLocaleTimeString('tr-TR')}`;
+    page.replaceChildren(RENDERERS[id](data));
+  } catch (e) {
+    page.replaceChildren(h('div', { class: 'card err' }, 'Veri alınamadı: ' + e.message));
+  }
+  page.classList.remove('updating');
+}
+
+function dailyUsageCard(u, metric = 'tokens') {
+  const series = u.providers.map(p => ({ key: p, label: pName(p), color: pColor(p) }));
+  const fmt = metric === 'cost' ? fmtUsd : fmtN;
+  const cols = u.daily.map(d => ({ label: dayLabel(d.day), tipTitle: new Date(d.day + 'T00:00').toLocaleDateString('tr-TR', { weekday: 'long', day: 'numeric', month: 'long' }),
+    values: Object.fromEntries(Object.entries(d.by).map(([k, v]) => [k, v[metric]])) }));
+  return card(metric === 'cost' ? 'Günlük maliyet' : 'Günlük token', 'sağlayıcıya göre', [legend(series), barChart(cols, series, { fmt })],
+    { tableView: () => table([{ label: 'Gün', get: r => dayLabel(r.day) }, ...u.providers.map(p => ({ label: pName(p), n: 1, get: r => fmt(r.by[p]?.[metric]) }))], [...u.daily].reverse()) });
+}
+
+/** Narrow a usage payload to one provider (charts, tables and totals). */
+function usageFor(u0) {
+  fOptions('provider', u0.providers, pName);
+  if (!fOn('provider')) return u0;
+  const p = flt.provider, row = u0.by_provider.find(x => x.provider === p) || { tokens: 0, input: 0, output: 0, cache_read: 0, cost: 0, calls: 0, sessions: 0 };
+  return {
+    ...u0, providers: u0.providers.filter(x => x === p),
+    daily: u0.daily.map(x => ({ ...x, by: x.by[p] ? { [p]: x.by[p] } : {} })),
+    by_provider: u0.by_provider.filter(x => x.provider === p),
+    by_model: u0.by_model.filter(x => x.provider === p),
+    totals: { ...u0.totals, tokens: row.tokens, input: row.input, output: row.output, cache_read: row.cache_read, cost: row.cost, calls: row.calls, sessions: row.sessions },
+    filtered: p,
+  };
+}
+
+function renderOverview(d) {
+  const u = usageFor(d.usage), t = u.totals;
+  fillProfiles(d.agents.map(a => a.name));
+  const kpis = h('div', { class: 'grid g-kpi' },
+    kpi('Toplam token', fmtN(t.tokens), `${fmtN(t.input)} girdi · ${fmtN(t.output)} çıktı`),
+    kpi('Maliyet', fmtUsd(t.cost), 'tahmini API karşılığı'),
+    kpi('Oturum', nfi.format(t.sessions), `${nfi.format(t.subagents)} alt ajan`),
+    kpi('API çağrısı', fmtN(t.calls)),
+    kpi('Araç çağrısı', fmtN(t.tool_calls)),
+    kpi('Önbellekten okunan', fmtN(t.cache_read), 'token'));
+  const share = card('Sağlayıcı payı', 'token', shareBar(u.by_provider.map(p => ({ label: pName(p.provider), value: p.tokens, color: pColor(p.provider) }))));
+  const models = card('En çok kullanılan modeller', 'token', hBars(u.by_model.map(m => ({ label: m.model, value: m.tokens, sub: pName(m.provider), color: pColor(m.provider) }))),
+    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'Sağlayıcı', get: r => pName(r.provider) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) }], u.by_model) });
+  const agents = card('Ajanlar', 'token', hBars(u.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) })), { max: 13 }));
+  const quotas = card('Kotalar', 'şu an', h('div', { class: 'grid g3' }, (d.quotas.items || []).filter(it => it.windows.length).map(it => quotaCard(it))));
+  const k = d.kanban[0];
+  const kanbanMini = k ? card('Kartlar · ' + k.board, '', h('div', { class: 'grid g-kpi' },
+    ['running', 'blocked', 'ready', 'todo'].filter(x => k.counts[x] != null).map(x => kpi(STATUS[x][0], nfi.format(k.counts[x]))),
+    kpi('Bu aralıkta biten', nfi.format(k.done_daily.reduce((a, b) => a + b.done, 0))))) : null;
+  const c = d.clis;
+  const srcKeys = ['hermes', ...c.sources.map(x => x.source)];
+  const srcSeries = srcKeys.map(k => ({ key: k, label: srcName(k), color: srcColor(k) }));
+  const srcCols = u.daily.map((x, i) => ({ label: dayLabel(x.day), tipTitle: new Date(x.day + 'T00:00').toLocaleDateString('tr-TR', { weekday: 'long', day: 'numeric', month: 'long' }),
+    values: { hermes: Object.values(x.by).reduce((a, v) => a + v.tokens, 0), ...(c.daily[i]?.tokens || {}) } }));
+  const allTok = t.tokens + c.sources.reduce((a, x) => a + x.tokens, 0);
+  const allCost = t.cost + c.sources.reduce((a, x) => a + x.cost, 0);
+  const allCard = card('Tüm kaynaklar', `Hermes + CLI ajanları · ${fmtN(allTok)} token · ${fmtUsd(allCost)}`,
+    [legend(srcSeries), barChart(srcCols, srcSeries)],
+    { tableView: () => table([{ label: 'Gün', get: r => r.label }, ...srcSeries.map(se => ({ label: se.label, n: 1, get: r => fmtN(r.values[se.key]) }))], [...srcCols].reverse()) });
+  const srcShare = card('Kaynak payı', 'token', shareBar([{ label: 'Hermes', value: t.tokens, color: srcColor('hermes') }, ...c.sources.map(x => ({ label: x.name, value: x.tokens, color: srcColor(x.source) }))]));
+  return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, allCard, srcShare), h('div', { class: 'grid g2' }, dailyUsageCard(u), dailyUsageCard(u, 'cost')),
+    h('div', { class: 'grid g2' }, share, quotas), h('div', { class: 'grid g2' }, models, agents), kanbanMini);
+}
+
+function renderAccounts(d) {
+  const u = usageFor(d.usage);
+  d = { ...d, quotas: { ...d.quotas, items: (d.quotas.items || []).filter(it => fIs('provider', it.provider)) },
+        history: d.history.filter(x => fIs('provider', x.provider)) };
+  const quotaGrid = h('div', { class: 'grid g3' }, (d.quotas.items || []).map(it => quotaCard(it)));
+  const refresh = h('button', { class: 'ctl', onclick: async ev => { ev.target.textContent = 'çekiliyor…'; const x = await api('accounts', '&force=1'); $('p-accounts').replaceChildren(renderAccounts(x)); } }, 'Kotaları şimdi çek');
+  const accountsFor = p => ((d.quotas.items || []).find(it => it.provider === p)?.accounts || []).map(a => a.label || a.source).join(', ') || '—';
+  const usageTable = card('Hesap bazında kullanım', 'seçili aralıkta', table([
+    { label: 'Sağlayıcı', get: r => h('span', {}, h('i', { style: `display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;background:${pColor(r.provider)}` }), pName(r.provider)) },
+    { label: 'Hesap', get: r => accountsFor(r.provider) },
+    { label: 'Girdi', n: 1, get: r => fmtN(r.input) }, { label: 'Çıktı', n: 1, get: r => fmtN(r.output) },
+    { label: 'Önbellek', n: 1, get: r => fmtN(r.cache_read) }, { label: 'API çağrısı', n: 1, get: r => fmtN(r.calls) },
+    { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Faturalama', get: r => r.mode === 'subscription_included' ? 'abonelik' : r.mode ? 'OAuth / API' : '—' },
+  ], u.by_provider));
+  const hist = d.history.filter(x => x.points.length);
+  const hs = hist.map((x, i) => ({ label: `${pName(x.provider)} · ${x.window}`, color: ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)'][i % 5], points: x.points }));
+  const histCard = card('Kota geçmişi', 'kullanım yüzdesi · panel 5 dk\'da bir kaydeder',
+    hs.length ? [legend(hs, 'line'), lineChart(hs)] : h('div', { class: 'empty' }, 'Henüz kayıt yok. Panel açık kaldıkça kota geçmişi burada birikir.'),
+    { tableView: () => table([{ label: 'Pencere', get: r => r.label }, { label: 'Son değer', n: 1, get: r => fmtPct(r.points.at(-1)?.[1]) }, { label: 'Ölçüm', n: 1, get: r => r.points.length }], hs) });
+  const multiples = h('div', { class: 'grid g3' }, u.providers.map(p => {
+    const cols = u.daily.map(x => ({ label: dayLabel(x.day), values: { v: x.by[p]?.tokens || 0 } }));
+    return card(pName(p), 'günlük token', barChart(cols, [{ key: 'v', label: pName(p), color: pColor(p) }], { height: 130 }));
+  }));
+  return h('div', { class: 'stack' }, h('div', { style: 'display:flex;justify-content:flex-end' }, refresh), quotaGrid, usageTable, histCard, multiples);
+}
+
+function renderAgents(d) {
+  fillProfiles(d.agents.map(a => a.name));
+  const [f, t] = rangeDates();
+  const days = []; for (let x = new Date(f + 'T00:00'); iso(x) <= t; x.setDate(x.getDate() + 1)) days.push(iso(x));
+  fOptions('provider', d.agents.map(a => a.provider), pName);
+  fOptions('status', ['running', 'idle'], STATUS_LABEL);
+  const all = d.agents.filter(a => !state.profile || a.name === state.profile);
+  const list = all.filter(a => fIs('provider', a.provider) && fIs('status', a.active ? 'running' : 'idle') && fMatch(a.name, a.model, a.last_title));
+  fCount(list.length, all.length, 'ajan');
+  const active = list.filter(a => a.active).length;
+  const kpis = h('div', { class: 'grid g-kpi' },
+    kpi('Ajan', String(list.length), `${active} tanesi şu an çalışıyor`),
+    kpi('Oturum', nfi.format(list.reduce((a, x) => a + x.sessions, 0))),
+    kpi('Token', fmtN(list.reduce((a, x) => a + x.tokens, 0))),
+    kpi('Maliyet', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'tahmini'),
+    kpi('Araç çağrısı', fmtN(list.reduce((a, x) => a + x.tool_calls, 0))));
+  const tbl = card('Ajanlar', 'seçili aralıkta', table([
+    { label: 'Ajan', get: r => h('div', {}, h('b', {}, r.name), r.error ? h('div', { class: 'err' }, r.error) : null) },
+    { label: 'Durum', get: r => statusEl(r.active ? 'running' : 'idle') },
+    { label: 'Model', get: r => h('div', {}, r.model || '—', h('div', { class: 'sub', style: 'font-size:11.5px' }, pName(r.provider || ''))) },
+    { label: 'Günlük', get: r => sparkline(days.map(x => r.daily[x] || 0), pColor(r.provider)) },
+    { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'Alt ajan', n: 1, get: r => nfi.format(r.subagents) },
+    { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Araç', n: 1, get: r => fmtN(r.tool_calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Son aktivite', get: r => h('div', {}, ago(r.last_activity), h('div', { class: 'sub', style: 'font-size:11.5px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.last_title || '')) },
+  ], [...list].sort((a, b) => b.active - a.active || b.tokens - a.tokens)));
+  const bars = card('Token dağılımı', '', hBars(list.map(a => ({ label: a.name, value: a.tokens, sub: a.model, color: pColor(a.provider) })), { max: 13 }));
+  const toolBars = card('Araç çağrıları', '', hBars(list.map(a => ({ label: a.name, value: a.tool_calls })), { max: 13, color: 'var(--s2)' }));
+  return h('div', { class: 'stack' }, kpis, tbl, h('div', { class: 'grid g2' }, bars, toolBars));
+}
+
+function renderSubagents(d) {
+  const scoped = d.subagents.filter(x => !state.profile || x.profile === state.profile);
+  const stKey = x => x.status === 'running' ? 'running' : (STATUS[x.status] ? x.status : 'ended');
+  fOptions('model', scoped.map(x => x.model));
+  fOptions('status', scoped.map(stKey), STATUS_LABEL);
+  const list = scoped.filter(x => fIs('model', x.model) && fIs('status', stKey(x)) && fMatch(x.title, x.parent, x.profile, x.model, x.activity));
+  fCount(list.length, scoped.length, 'alt ajan');
+  const running = list.filter(x => x.status === 'running');
+  const durs = list.map(x => x.duration).filter(x => x > 0);
+  const kpis = h('div', { class: 'grid g-kpi' },
+    kpi('Alt ajan', nfi.format(list.length), `${running.length} tanesi şu an çalışıyor`),
+    kpi('Ortalama süre', dur(durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null)),
+    kpi('Token', fmtN(list.reduce((a, x) => a + x.tokens, 0))),
+    kpi('Maliyet', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'tahmini'),
+    kpi('Araç çağrısı', fmtN(list.reduce((a, x) => a + x.tools, 0))));
+  const perDay = Object.fromEntries(d.days.map(x => [x, 0]));
+  list.forEach(x => { const k = iso(new Date(x.started * 1000)); if (k in perDay) perDay[k]++; });
+  const dayCard = card('Günlük alt ajan sayısı', '', barChart(d.days.map(x => ({ label: dayLabel(x), values: { v: perDay[x] } })), [{ key: 'v', label: 'Alt ajan', color: 'var(--s1)' }], { height: 150, fmt: v => nfi.format(Math.round(v)) }));
+  const byProf = {};
+  list.forEach(x => byProf[x.profile] = (byProf[x.profile] || 0) + 1);
+  const profCard = card('Ajana göre', 'alt ajan sayısı', hBars(Object.entries(byProf).map(([k, v]) => ({ label: k, value: v })), { fmt: v => nfi.format(v) }));
+  const tbl = card('Alt ajanlar', `en yeni ${list.length}`, table([
+    { label: 'Durum', get: r => statusEl(r.status) },
+    { label: 'Görev', get: r => h('div', { style: 'max-width:380px' }, r.title || '(başlıksız)', h('div', { class: 'sub', style: 'font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.parent ? '↰ ' + r.parent : '')) },
+    { label: 'Ajan', get: r => r.profile }, { label: 'Model', get: r => r.model || '—' },
+    { label: 'Süre', n: 1, get: r => dur(r.duration) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) },
+    { label: 'Araç', n: 1, get: r => nfi.format(r.tools) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Başladı', get: r => ago(r.started) },
+  ], list));
+  return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, dayCard, profCard), tbl);
+}
+
+function renderClis(d0) {
+  fOptions('source', d0.sessions.map(x => x.source), srcName);
+  fOptions('model', d0.sessions.map(x => x.model));
+  fOptions('status', ['running', 'idle'], STATUS_LABEL);
+  const keepS = x => fIs('source', x.source) && fIs('model', x.model) && fIs('status', x.running ? 'running' : 'idle')
+    && fMatch(x.title, x.project, x.model, srcName(x.source));
+  const d = { ...d0, sessions: d0.sessions.filter(keepS),
+    sources: d0.sources.filter(x => fIs('source', x.source)),
+    by_model: d0.by_model.filter(x => fIs('source', x.source) && fIs('model', x.model)),
+    daily: d0.daily.map(x => ({ ...x, tokens: Object.fromEntries(Object.entries(x.tokens).filter(([k]) => fIs('source', k))),
+                                      cost: Object.fromEntries(Object.entries(x.cost).filter(([k]) => fIs('source', k))) })) };
+  // search / status narrow the session list: recompute the per-CLI cards from the matching sessions
+  if (fOn('q') || fOn('status') || fOn('model')) {
+    d.sources = d.sources.map(src => {
+      const ss = d.sessions.filter(x => x.source === src.source);
+      return { ...src, tokens: ss.reduce((a, x) => a + x.tokens, 0), cost: ss.reduce((a, x) => a + x.cost, 0),
+               sessions: ss.filter(x => !x.subagent).length, subagents: ss.filter(x => x.subagent).length };
+    }).filter(src => src.tokens || src.sessions);
+  }
+  fCount(d.sessions.filter(x => !x.subagent).length, d0.sessions.filter(x => !x.subagent).length, 'oturum');
+  const kpis = h('div', { class: 'grid g-kpi' }, d.presence.map(p => {
+    const src = d.sources.find(x => x.source === p.source);
+    return h('div', { class: 'card kpi', style: `border-top:3px solid ${srcColor(p.source)}` },
+      h('div', { class: 'label' }, p.name),
+      h('div', { class: 'value' }, src ? fmtN(src.tokens) : '—'),
+      h('div', { class: 'hint' }, src ? `${fmtUsd(src.cost)} · ${src.sessions} oturum · ${src.subagents} alt ajan`
+        : p.tracked ? 'bu aralıkta kullanılmamış' : `izlenmiyor · son hareket ${ago(p.last_activity)}`));
+  }));
+  const series = d.sources.map(x => ({ key: x.source, label: x.name, color: srcColor(x.source) }));
+  const cols = d.daily.map(x => ({ label: dayLabel(x.day), values: x.tokens }));
+  const dayCard = card('Günlük token', 'CLI\'ya göre', [legend(series), barChart(cols, series)],
+    { tableView: () => table([{ label: 'Gün', get: r => dayLabel(r.day) }, ...series.map(se => ({ label: se.label, n: 1, get: r => fmtN(r.tokens[se.key]) }))], [...d.daily].reverse()) });
+  const costCols = d.daily.map(x => ({ label: dayLabel(x.day), values: x.cost }));
+  const costCard = card('Günlük maliyet', 'tahmini API karşılığı', [legend(series), barChart(costCols, series, { fmt: fmtUsd })]);
+  const models = card('Modeller', 'token', hBars(d.by_model.map(m => ({ label: m.model, value: m.tokens, sub: srcName(m.source) + ' · ' + fmtUsd(m.cost), color: srcColor(m.source) }))),
+    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'CLI', get: r => srcName(r.source) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) }], d.by_model) });
+  const proj = {};
+  d.sessions.forEach(x => { const k = (x.project || '—').replace(/^\/Users\/[^/]+/, '~'); (proj[k] ||= { tokens: 0, cost: 0 }); proj[k].tokens += x.tokens; proj[k].cost += x.cost; });
+  const projCard = card('Projeler', 'token', hBars(Object.entries(proj).map(([k, v]) => ({ label: k, value: v.tokens, sub: fmtUsd(v.cost) }))));
+  const byParent = {};
+  d.sessions.filter(x => x.subagent).forEach(x => (byParent[x.parent] ||= []).push(x));
+  const mains = d.sessions.filter(x => !x.subagent);
+  const tbl = card('Oturumlar', `${mains.length} oturum · ${d.sessions.length - mains.length} alt ajan`, table([
+    { label: 'Durum', get: r => statusEl(r.running ? 'running' : 'idle') },
+    { label: 'CLI', get: r => h('span', { style: `color:${srcColor(r.source)};font-weight:600` }, srcName(r.source)) },
+    { label: 'Oturum', get: r => h('div', { style: 'max-width:380px' }, r.title || '(başlıksız)', h('div', { class: 'sub', style: 'font-size:11.5px' },
+        [(r.project || '').replace(/^\/Users\/[^/]+/, '~'), byParent[r.id] ? `${byParent[r.id].length} alt ajan` : null].filter(Boolean).join(' · '))) },
+    { label: 'Model', get: r => r.model || '—' },
+    { label: 'Token', n: 1, get: r => fmtN(r.tokens + (byParent[r.id] || []).reduce((a, x) => a + x.tokens, 0)) },
+    { label: 'Önbellek', n: 1, get: r => fmtN(r.cache_read) },
+    { label: 'Çağrı', n: 1, get: r => nfi.format(r.calls) },
+    { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost + (byParent[r.id] || []).reduce((a, x) => a + x.cost, 0)) },
+    { label: 'Son', get: r => ago(r.last) },
+  ], mains));
+  const note = h('div', { class: 'note' }, 'Claude Code, Hermes ile aynı Anthropic hesabının kotasını kullanır; kota durumu "Hesaplar & Kotalar" sayfasında. Token = girdi + çıktı (önbellekten okunan ayrı gösterilir). Gemini / Antigravity ve Factory Droid kullanım kaydı tutmadığı için sadece son hareket gösterilir.');
+  return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, dayCard, costCard), h('div', { class: 'grid g2' }, models, projCard), tbl, note);
+}
+
+const KORDER = ['running', 'blocked', 'ready', 'todo', 'triage', 'done'];
+function renderKanban(d) {
+  if (!d.boards.length) return h('div', { class: 'card empty' }, 'Kart yok.');
+  return h('div', { class: 'stack' }, d.boards.map(b => {
+    const assignees = b.by_assignee.filter(a => !state.profile || a.assignee === state.profile);
+    const scoped = b.cards.filter(c => !state.profile || c.assignee === state.profile);
+    fOptions('status', scoped.map(c => c.status), STATUS_LABEL);
+    const cards = scoped.filter(c => fIs('status', c.status) && fMatch(c.title, c.assignee, c.last_failure_error));
+    fCount(cards.length, scoped.length, 'kart');
+    const doneInRange = b.done_daily.reduce((a, x) => a + x.done, 0);
+    const kpis = h('div', { class: 'grid g-kpi' },
+      KORDER.filter(x => x !== 'done' && b.counts[x] != null).map(x => kpi(STATUS[x][0], nfi.format(b.counts[x]))),
+      kpi('Bu aralıkta biten', nfi.format(doneInRange)), kpi('Toplam', nfi.format(Object.values(b.counts).reduce((a, x) => a + x, 0)), `${b.counts.archived || 0} arşivde`));
+    const doneCard = card('Günlük biten kart', '', barChart(b.done_daily.map(x => ({ label: dayLabel(x.day), values: { v: x.done } })), [{ key: 'v', label: 'Biten', color: 'var(--s3)' }], { height: 150, fmt: v => nfi.format(Math.round(v)) }));
+    const aSeries = [{ key: 'done', label: 'Biten (aralıkta)', color: 'var(--s1)' }, { key: 'running', label: 'Çalışan', color: 'var(--s2)' }, { key: 'blocked', label: 'Bloklu', color: 'var(--s4)' }];
+    const aCard = card('Ajana göre kartlar', '', table([{ label: 'Ajan', get: r => r.assignee }, ...aSeries.map(se => ({ label: se.label, n: 1, get: r => nfi.format(r[se.key] || 0) })),
+      { label: 'Diğer', n: 1, get: r => nfi.format(Object.entries(r).filter(([k]) => !['assignee', 'done', 'running', 'blocked'].includes(k)).reduce((a, [, v]) => a + v, 0)) }], assignees));
+    const statuses = [...new Set([...KORDER.filter(x => cards.some(c => c.status === x)), ...cards.map(c => c.status)])];
+    const cols = h('div', { class: 'cols' }, statuses.map(st => {
+      const cs = cards.filter(c => c.status === st);
+      return h('div', { class: 'col' }, h('h4', {}, statusEl(st), h('span', { class: 'sub' }, st === 'done' ? `${cs.length} (aralıkta)` : String(b.counts[st] ?? cs.length))),
+        cs.slice(0, st === 'done' ? 12 : 40).map(c => h('div', { class: 'kcard' }, c.title,
+          h('div', { class: 'sub' }, `${c.assignee || 'atanmamış'} · ${ago(c.completed_at || c.last_heartbeat_at || c.started_at || c.created_at)}`),
+          c.consecutive_failures ? h('div', { class: 'err' }, `${c.consecutive_failures} hata: ${(c.last_failure_error || '').slice(0, 120)}`) : null)));
+    }));
+    return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, doneCard, aCard), card('Pano · ' + b.board, '', cols));
+  }));
+}
+
+// ---------- boot ----------
+const RENDERERS = { overview: renderOverview, accounts: renderAccounts, agents: renderAgents, subagents: renderSubagents, clis: renderClis, kanban: renderKanban };
+buildChrome();
+buildFilters();
+const hashPage = location.hash.slice(1);
+go(PAGES.some(p => p.id === hashPage) ? hashPage : PAGES.some(p => p.id === state.page) ? state.page : 'live');
+if (state.page !== 'live') loadLive();
+</script>
+</body>
+</html>
