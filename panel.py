@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
@@ -39,6 +40,12 @@ HERE = Path(__file__).parent
 PANEL_DB = HERE / "panel.db"
 QUOTA_TTL = 120          # provider usage APIs are cached this many seconds
 QUOTA_RECORD_EVERY = 300  # background quota snapshot interval (history charts)
+ANTHROPIC_USAGE_TTL = 300  # an account's Claude usage is re-read at most this often (the "fetch now" button bypasses it)
+ANTHROPIC_BACKOFF = (120, 240, 480, 900)  # seconds to stay silent after the 1st, 2nd, ... consecutive 429 (last = cap)
+ANTHROPIC_RETRY_AFTER_MAX = 3600  # a Retry-After longer than this is clamped
+IDENTITY_REFUSED_TTL = 1800  # an identity request answered 401/403 is not repeated for this long
+IDENTITY_ERROR_TTL = 120     # ... answered with any other failure
+STALE_MAX_AGE = 7 * 86400    # quota_history rows older than this are not shown as "last known"
 ACTIVE_WINDOW = 600       # a session with activity in the last N seconds counts as running
 
 _quota_cache = {"at": 0.0, "data": None}
@@ -199,8 +206,21 @@ def _anthropic_usage():
     token = (resolve_anthropic_token() or "").strip()
     if not token or not _is_oauth_token(token):
         return None  # API-key accounts have no usage windows; let Hermes' helper report that
+    unavailable = None
+    windows = ()
+    if _anthropic_wait() > 0:
+        unavailable = "rate limited"  # backing off after a 429: no request
+    else:
+        try:
+            windows = tuple(_anthropic_windows(token))
+            _anthropic_ok()
+        except Exception as ex:
+            if _http_status(ex) != 429:
+                raise  # _usage_snapshot falls back to Hermes' own reader
+            _anthropic_rate_limited(ex)
+            unavailable = "rate limited"
     return AccountUsageSnapshot(provider="anthropic", source="oauth_usage_api", fetched_at=datetime.now(),
-                                windows=tuple(_anthropic_windows(token)))
+                                windows=windows, unavailable_reason=unavailable)
 
 
 def _anthropic_windows(token):
@@ -223,24 +243,155 @@ ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 _anthropic_aliases = {}  # old quota_history provider id -> current "anthropic#<account-key>" (see quota_history)
 
 
-def _anthropic_identity(token):
+# Claude's OAuth endpoints answer 429 quickly when polled: remember what we learned instead of asking again.
+_anthropic_lock = threading.Lock()
+_anthropic_gate = {"until": 0.0, "fails": 0}  # shared 429 backoff: no request to Anthropic before `until`
+_anthropic_identities = {}  # token fingerprint -> {"key": account key | None, "at": ts, "ttl": seconds | None}
+_anthropic_last_good = {}   # quota item provider id -> {"wins": [...], "at": ts}
+
+
+def _anthropic_reset_state():
+    with _anthropic_lock:
+        _anthropic_gate.update(until=0.0, fails=0)
+        _anthropic_identities.clear()
+        _anthropic_last_good.clear()
+
+
+def _http_status(ex):
+    return getattr(getattr(ex, "response", None), "status_code", None)
+
+
+def _retry_after_s(ex):
+    """Seconds the server asked us to wait (Retry-After: seconds or HTTP date), else None."""
+    headers = getattr(getattr(ex, "response", None), "headers", None)
+    v = headers.get("retry-after") if headers is not None else None
+    if not v:
+        return None
+    try:
+        return max(0.0, float(v))
+    except ValueError:
+        try:
+            return max(0.0, parsedate_to_datetime(v).timestamp() - time.time())
+        except (TypeError, ValueError):
+            return None
+
+
+def _anthropic_wait(now=None):
+    """Seconds left of the 429 backoff (0 = free to ask)."""
+    return max(0.0, _anthropic_gate["until"] - (now or time.time()))
+
+
+def _anthropic_rate_limited(ex, now=None):
+    """A 429 came back: honour Retry-After, else back off 2 -> 4 -> 8 -> 15 min. Returns the wait in seconds."""
+    now = now or time.time()
+    with _anthropic_lock:
+        _anthropic_gate["fails"] += 1
+        ra = _retry_after_s(ex)
+        step = min(_anthropic_gate["fails"], len(ANTHROPIC_BACKOFF)) - 1
+        wait = min(ra, ANTHROPIC_RETRY_AFTER_MAX) if ra else ANTHROPIC_BACKOFF[step]
+        _anthropic_gate["until"] = max(_anthropic_gate["until"], now + wait)
+    return wait
+
+
+def _anthropic_ok():
+    with _anthropic_lock:
+        _anthropic_gate.update(until=0.0, fails=0)
+
+
+def _identity_slot_db(slot, key=None):
+    """Persisted account key of a credential slot ("source|label"): read when key is None, else written.
+    Only a stand-in while Anthropic refuses to answer; a successful profile read always wins."""
+    try:
+        with rw(PANEL_DB) as c:
+            c.execute("CREATE TABLE IF NOT EXISTS anthropic_identity (slot TEXT PRIMARY KEY, key TEXT, ts REAL)")
+            if key is None:
+                r = c.execute("SELECT key FROM anthropic_identity WHERE slot = ?", (slot,)).fetchone()
+                return r[0] if r else None
+            c.execute("INSERT OR REPLACE INTO anthropic_identity VALUES (?,?,?)", (slot, key, time.time()))
+    except Exception:
+        pass
+    return None
+
+
+def _anthropic_identity(token, slot=None):
     """Account key of a Claude OAuth credential, or None when it cannot be read.
 
     Source: Anthropic's OAuth profile endpoint (GET https://api.anthropic.com/api/oauth/profile, the one Claude Code
     itself calls). Its answer carries `account.uuid` (and `organization.uuid`); the key is the first 8 hex digits of
     sha256(account uuid), so the raw id never leaves this process. Tokens without the `user:profile` scope (e.g. a
-    setup token in ANTHROPIC_TOKEN) get HTTP 403 and stay unreadable (None) — never guessed from the label."""
+    setup token in ANTHROPIC_TOKEN) get HTTP 403 and stay unreadable (None) — never guessed from the label.
+
+    The answer is cached per token fingerprint (only a refreshed token is asked again), and nothing is asked while
+    the 429 backoff runs. `slot` ("source|label") lets a key learned earlier stand in while Anthropic rate limits us."""
     import httpx
 
+    fp = hashlib.sha256(str(token).encode()).hexdigest()[:16]
+    now = time.time()
+    hit = _anthropic_identities.get(fp)
+    if hit and (hit["ttl"] is None or now - hit["at"] < hit["ttl"]):
+        return hit["key"]
+    remembered = _identity_slot_db(slot) if slot else None
+    if _anthropic_wait(now) > 0:
+        return remembered
     try:
         r = httpx.get(ANTHROPIC_PROFILE_URL, timeout=15,
                       headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
                                "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"})
         r.raise_for_status()
         uid = ((r.json() or {}).get("account") or {}).get("uuid")
+    except Exception as ex:
+        code = _http_status(ex)
+        if code == 429:
+            _anthropic_rate_limited(ex, now)
+            return remembered  # not cached: asked again once the backoff is over
+        _anthropic_identities[fp] = {"key": None, "at": now,
+                                     "ttl": IDENTITY_REFUSED_TTL if code in (401, 403) else IDENTITY_ERROR_TTL}
+        return None if code in (401, 403) else remembered
+    key = hashlib.sha256(str(uid).encode()).hexdigest()[:8] if uid else None
+    _anthropic_identities[fp] = {"key": key, "at": now, "ttl": None if key else IDENTITY_ERROR_TTL}
+    if key and slot:
+        _identity_slot_db(slot, key)
+    return key
+
+
+def _stale_windows(provider):
+    """Last successfully read windows of a quota item -> (windows, read-at ts) or (None, None).
+    Memory first; after a restart quota_history (panel.db) still has them."""
+    mem = _anthropic_last_good.get(provider)
+    if mem:
+        return mem["wins"], mem["at"]
+    ids = [provider] + [old for old, new in _anthropic_aliases.items() if new == provider]
+    marks = ",".join("?" * len(ids))
+    try:
+        with rw(PANEL_DB) as c:
+            c.execute("""CREATE TABLE IF NOT EXISTS quota_history
+                         (ts REAL, provider TEXT, window TEXT, used REAL, reset REAL)""")
+            rows = c.execute(f"""SELECT h.window, h.used, h.reset, h.ts FROM quota_history h
+                                 JOIN (SELECT window w, MAX(ts) m FROM quota_history
+                                       WHERE provider IN ({marks}) AND ts >= ? AND used IS NOT NULL GROUP BY window) x
+                                   ON h.window = x.w AND h.ts = x.m
+                                 WHERE h.provider IN ({marks}) AND h.used IS NOT NULL
+                                 ORDER BY h.rowid""", (*ids, time.time() - STALE_MAX_AGE, *ids)).fetchall()
     except Exception:
-        return None
-    return hashlib.sha256(str(uid).encode()).hexdigest()[:8] if uid else None
+        return None, None
+    if not rows:
+        return None, None
+    latest = {w: (u, r, ts) for w, u, r, ts in rows}  # one row per window (aliases can tie on ts)
+    return ([{"label": w, "used": u, "reset": r or None, "detail": None} for w, (u, r, _) in latest.items()],
+            max(ts for _, _, ts in latest.values()))
+
+
+def _apply_stale(item):
+    """Item that could not be read right now keeps the last known windows, marked stale (stale / fetched_at = when
+    those windows were really read). A freshly read item is remembered as the new last good one."""
+    if item["windows"]:
+        at = item.get("fetched_at") or time.time()  # preset when the windows were reused inside the usage TTL
+        _anthropic_last_good[item["provider"]] = {"wins": item["windows"], "at": at}
+        item.update(stale=False, fetched_at=at)
+        return item
+    wins, at = _stale_windows(item["provider"]) if item.get("unavailable_code") else (None, None)
+    item.update(stale=bool(wins), fetched_at=at, windows=wins or [])
+    return item
 
 
 def _windows_sig(wins):
@@ -258,16 +409,17 @@ def _group_anthropic(creds):
        digit (same account, same moment), else stays its own item (key = hash of the windows);
     3. nothing readable (403/timeout) -> never its own item: listed as "unverified" under the first item, or, when no
        credential at all is readable, all together under one plain "anthropic" item."""
-    groups = {}  # key -> {"creds": [...], "wins": [...], "err": ...}
+    groups = {}  # key -> {"creds": [...], "wins": [...], "err": ..., "http": ...}
     unreadable = []
     for c in creds:
         if c["key"]:
-            g = groups.setdefault(c["key"], {"creds": [], "wins": [], "err": None})
+            g = groups.setdefault(c["key"], {"creds": [], "wins": [], "err": None, "http": None})
             g["creds"].append(dict(c, status_of="verified"))
             if c["wins"] and not g["wins"]:
                 g["wins"] = c["wins"]
             if c["err"] and not c["wins"]:
                 g["err"] = g["err"] or c["err"]
+                g["http"] = g["http"] or c["http"]  # the HTTP code travels with the error (429, 403, ...)
     for c in creds:
         if c["key"]:
             continue
@@ -278,7 +430,7 @@ def _group_anthropic(creds):
                 hit["creds"].append(dict(c, status_of="same_windows"))
             else:
                 k = "w" + hashlib.sha256(repr(sig).encode()).hexdigest()[:7]
-                g = groups.setdefault(k, {"creds": [], "wins": c["wins"], "err": None})
+                g = groups.setdefault(k, {"creds": [], "wins": c["wins"], "err": None, "http": None})
                 g["creds"].append(dict(c, status_of="same_windows" if g["creds"] else "windows_only"))
         else:
             unreadable.append(c)
@@ -293,28 +445,83 @@ def _group_anthropic(creds):
     return [dict(g, key=k) for k, g in groups.items()]
 
 
-def _anthropic_account_items():
+def _anthropic_read_creds(entries, force=False):
+    """Read Claude credentials with as few Anthropic requests as possible -> creds for _group_anthropic.
+
+    - the account behind each credential comes from the identity cache (see _anthropic_identity);
+    - usage is read with ONE credential per account (priority order; the next one only when that failed), and not at
+      all while the account's last reading is younger than ANTHROPIC_USAGE_TTL (force=True skips this);
+    - credentials whose account cannot be read are tried only when no account yielded windows (nothing says they are
+      another account; otherwise they stay listed as unverified);
+    - after a 429 nothing is asked until the backoff is over (see _anthropic_rate_limited)."""
+    rows = [{"e": e, "key": _anthropic_identity(e.runtime_api_key, slot=f"{e.source}|{e.label}"),
+             "wins": [], "err": None, "http": None} for e in entries]
+    rows.sort(key=lambda r: (r["e"].priority if r["e"].priority is not None else 99, r["e"].label or ""))
+
+    def read(r):
+        if _anthropic_wait() > 0:
+            return False  # backing off: left without an error here, marked rate limited below
+        try:
+            r["wins"] = [{"label": w.label, "used": w.used_percent,
+                          "reset": w.reset_at.timestamp() if w.reset_at else None, "detail": None}
+                         for w in _anthropic_windows(r["e"].runtime_api_key)]
+            _anthropic_ok()
+            return True
+        except Exception as ex:  # an expired token is refreshed by Hermes on its next use of that account
+            code = _http_status(ex)
+            if code == 429:
+                _anthropic_rate_limited(ex)
+                r.update(err="rate limited", http=429)
+            else:
+                r.update(err="usage not readable right now", http=code)
+            return False
+
+    got = False
+    done = set()
+    for r in rows:
+        if not r["key"] or r["key"] in done:
+            continue
+        mine = [x for x in rows if x["key"] == r["key"]]
+        recent = _anthropic_last_good.get(f"anthropic#{r['key']}")
+        if recent and not force and time.time() - recent["at"] < ANTHROPIC_USAGE_TTL:
+            mine[0]["wins"] = recent["wins"]  # the same reading as a moment ago: no request
+            mine[0]["read_at"] = recent["at"]
+            done.add(r["key"])
+            got = True
+            continue
+        done.add(r["key"])
+        for x in mine:
+            if read(x):
+                got = True
+                break
+            if _anthropic_wait() > 0:
+                break
+    if not got:
+        for r in rows:
+            if not r["key"] and read(r):
+                break
+            if _anthropic_wait() > 0:
+                break
+    if _anthropic_wait() > 0:  # whoever was not asked because of the backoff reports it as the reason
+        for r in rows:
+            if not r["wins"] and not r["err"]:
+                r.update(err="rate limited", http=429)
+    return rows
+
+
+def _anthropic_account_items(force=False):
     """Claude OAuth credentials in Hermes' pool grouped by the ACCOUNT behind them (provider id
     "anthropic#<account-key>"), each read with its own token; None when the pool has fewer than 2 OAuth entries.
-    Two credentials of one account (e.g. ANTHROPIC_TOKEN + claude_code) become ONE item with both in `accounts`."""
+    Two credentials of one account (e.g. ANTHROPIC_TOKEN + claude_code) become ONE item with both in `accounts`.
+    An item that cannot be read now (429, ...) keeps its last known windows: stale=True, fetched_at, and the reason
+    in unavailable_code / unavailable_http (see _apply_stale)."""
     from agent.credential_pool import load_pool
 
     entries = [e for e in load_pool("anthropic").entries() if e.auth_type == "oauth"]
     if len(entries) < 2:
         return None
 
-    def one(e):
-        key = _anthropic_identity(e.runtime_api_key)
-        try:
-            wins = [{"label": w.label, "used": w.used_percent, "reset": w.reset_at.timestamp() if w.reset_at else None,
-                     "detail": None} for w in _anthropic_windows(e.runtime_api_key)]
-            return {"e": e, "key": key, "wins": wins, "err": None, "http": None}
-        except Exception as ex:  # an expired token is refreshed by Hermes on its next use of that account
-            code = getattr(getattr(ex, "response", None), "status_code", None)
-            return {"e": e, "key": key, "wins": [], "err": "usage not readable right now", "http": code}
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        creds = list(pool.map(one, entries))
+    creds = _anthropic_read_creds(entries, force)
     items = []
     for g in _group_anthropic(creds):
         accs = []
@@ -331,11 +538,17 @@ def _anthropic_account_items():
             accs.append(acc)
         accs.sort(key=lambda a: (a["priority"] if a["priority"] is not None else 99, a["label"] or ""))
         err = None if g["wins"] else (g["err"] or None)
-        items.append({"provider": f"anthropic#{g['key']}" if g["key"] else "anthropic",
-                      "account_key": g["key"], "accounts": accs, "windows": g["wins"], "details": [], "plan": None,
-                      "unavailable": (f"{err} (HTTP {g['http']})" if g.get("http") else err) if err else None,
-                      "unavailable_code": "usage_unreadable" if err else None,
-                      "unavailable_http": g.get("http") if err else None})
+        http = g.get("http") if err else None
+        code = None if not err else "rate_limited" if http == 429 else "usage_unreadable"
+        item = {"provider": f"anthropic#{g['key']}" if g["key"] else "anthropic",
+                "account_key": g["key"], "accounts": accs, "windows": g["wins"], "details": [], "plan": None,
+                "unavailable": (f"{err} (HTTP {http})" if http else err) if err else None,
+                "unavailable_code": code, "unavailable_http": http,
+                "retry_at": time.time() + _anthropic_wait() if code == "rate_limited" and _anthropic_wait() > 0 else None}
+        reused = [c["read_at"] for c in g["creds"] if c.get("read_at")]
+        if g["wins"] and reused:
+            item["fetched_at"] = min(reused)  # windows reused inside the usage TTL: say when they were really read
+        items.append(_apply_stale(item))
         for c in g["creds"]:  # history written under the old per-label ids follows the account
             _anthropic_aliases[f"anthropic#{c['e'].label}"] = items[-1]["provider"]
     if len(items) == 1:  # one account: every older anthropic series belongs to it
@@ -353,6 +566,8 @@ def _usage_snapshot(prov):
             snap = None
         if snap is not None:
             return snap
+        if _anthropic_wait() > 0:  # backing off: Hermes' own reader below must not ask either
+            return None
     """Hermes' own fetch picks a credential via pool.select(), which skips exhausted ones, so a provider
     whose only account hit its limit shows nothing. The usage endpoint still answers for it: retry with
     each pooled credential explicitly (a read-only GET with that account's own token)."""
@@ -384,7 +599,18 @@ def _window_label(w, snap):
     return w.label
 
 
-def _fetch_quotas():
+def _anthropic_quota(force=False):
+    """-> (per-account items | None, snapshot | None). The per-account reader goes first and its answer is final;
+    only a pool without two Claude OAuth credentials falls back to the single-snapshot reader (never both: that
+    would double the requests)."""
+    try:
+        split = _anthropic_account_items(force)
+    except Exception:
+        split = None
+    return (split, None) if split else (None, _usage_snapshot("anthropic"))
+
+
+def _fetch_quotas(force=False):
     from agent.credential_pool import load_pool
     from hermes_cli.auth import read_credential_pool
 
@@ -396,12 +622,18 @@ def _fetch_quotas():
 
     out = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        futures = {p: pool.submit(_usage_snapshot, p) for p in sorted(providers)}
+        futures = {p: pool.submit(_anthropic_quota, force) if p == "anthropic" else pool.submit(_usage_snapshot, p)
+                   for p in sorted(providers)}
         for prov, fut in futures.items():
+            split = None
             try:
-                snap = fut.result(timeout=20)
+                res = fut.result(timeout=60 if prov == "anthropic" else 20)
+                split, snap = res if prov == "anthropic" else (None, res)
             except Exception:
                 snap = None
+            if split:
+                out.extend(split)
+                continue
             try:
                 entries = [
                     {"label": e.label, "source": e.source, "status": e.last_status,
@@ -424,13 +656,11 @@ def _fetch_quotas():
             elif not entries:
                 continue
             if prov == "anthropic":
-                try:
-                    split = _anthropic_account_items()
-                except Exception:
-                    split = None
-                if split:
-                    out.extend(split)
-                    continue
+                if item["unavailable"] == "rate limited":
+                    item.update(unavailable="rate limited (HTTP 429)", unavailable_code="rate_limited",
+                                unavailable_http=429,
+                                retry_at=time.time() + _anthropic_wait() if _anthropic_wait() > 0 else None)
+                _apply_stale(item)
             out.append(item)
     return out
 
@@ -442,16 +672,17 @@ def _record_quotas(items):
         now = time.time()
         c.executemany("INSERT INTO quota_history VALUES (?,?,?,?,?)",
                       [(now, it["provider"], w["label"], w["used"], w["reset"])
-                       for it in items for w in it["windows"] if w["used"] is not None])
+                       for it in items if not it.get("stale")  # a last known value is not a new reading
+                       for w in it["windows"] if w["used"] is not None])
 
 
-def _refresh_quotas():
+def _refresh_quotas(force=False):
     # provider APIs can take up to ~20 s; only one refresh runs at a time
     if not _quota_lock.acquire(blocking=False):
         return
     try:
         try:
-            items = _fetch_quotas()
+            items = _fetch_quotas(force)
             _quota_cache["data"] = {"items": items, "error": None}
             _record_quotas(items)
         except Exception as e:
@@ -470,7 +701,7 @@ def quotas(force=False):
     if force and time.time() - _quota_cache["at"] < FORCE_MIN_INTERVAL:
         force = False
     if force:
-        _refresh_quotas()
+        _refresh_quotas(force=True)
     elif not _quota_cache["data"] or time.time() - _quota_cache["at"] > QUOTA_TTL:
         threading.Thread(target=_refresh_quotas, daemon=True).start()
     data = _quota_cache["data"] or {"items": [], "error": None, "loading": True}

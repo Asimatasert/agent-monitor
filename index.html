@@ -605,26 +605,33 @@ function gauge(w) {
   const p = w.used == null ? null : Math.max(0, Math.min(100, w.used));
   const tone = p == null ? 'var(--muted)' : p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
   return h('div', { class: 'gauge' },
-    h('div', { class: 'row' }, h('span', {}, winName(w.label)), h('b', {}, p == null ? '—' : fmtPct(p) + ' kullanıldı')),
-    h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })),
+    h('div', { class: 'row' }, h('span', {}, winName(w.label)), h('b', {}, p == null ? '—' : fmtPct(p) + (w.stale ? ' (son değer)' : ' kullanıldı'))),
+    h('div', { class: 'track', style: w.stale ? 'opacity:.55' : '' }, h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })),
     h('div', { class: 'sub', style: 'font-size:11.5px' }, [until(w.reset), w.detail].filter(Boolean).join(' · ')));
 }
 
 const CRED_KIND = src => /^env:/.test(src || '') ? 'ortam değişkeni' : src === 'claude_code' ? 'Claude Code girişi' : src === 'gh_cli' ? 'GitHub CLI' : (src || '');
-const unavailText = it => it.unavailable_code === 'usage_unreadable'
+const retryText = it => it.retry_at > Date.now() / 1000 ? dur(it.retry_at - Date.now() / 1000).replace(/ \d+ sn$/, '') + ' sonra yeniden denenecek' : '';
+const unavailText = it => it.unavailable_code === 'rate_limited'
+  ? `Hız sınırı (HTTP ${it.unavailable_http || 429}) — sağlayıcı isteği geri çevirdi${retryText(it) ? '; ' + retryText(it) : ''}.`
+  : it.unavailable_code === 'usage_unreadable'
   ? `Kullanım okunamıyor${it.unavailable_http ? ' (HTTP ' + it.unavailable_http + ')' : ''} — kimlik bilgisinin izni yetmiyor ya da sağlayıcı yanıt vermiyor.` : it.unavailable;
+/** "Son değer, 5 dk önce · hız sınırı": the windows shown are the last good reading, not a fresh one. */
+const staleText = it => `Son değer, ${ago(it.fetched_at)} · ${it.unavailable_code === 'rate_limited' ? 'hız sınırı' : 'kullanım şu an okunamıyor'}`
+  + (retryText(it) ? ' · ' + retryText(it) : '');
 const unverifiedWhy = a => `Bu kimlik bilgisinin hangi hesaba ait olduğu okunamadı${a.http ? ' (HTTP ' + a.http + ')' : ''}; aynı hesap olup olmadığı bilinmiyor.`;
 
 function quotaCard(it, burn = []) {
   const kids = [];
+  if (it.stale) kids.push(h('div', { class: 'note', style: 'margin:0;color:var(--warn)', title: unavailText(it) }, staleText(it)));
   it.windows.forEach(w => {
-    kids.push(gauge(w));
+    kids.push(gauge({ ...w, stale: it.stale }));
     const b = burn.find(x => x.provider === it.provider && x.window === w.label);
-    if (b && b.per_hour > 0.01) kids.push(h('div', { class: 'note', style: 'margin-top:0' },
+    if (b && b.per_hour > 0.01 && !it.stale) kids.push(h('div', { class: 'note', style: 'margin-top:0' },
       `Saatte +%${b.per_hour.toFixed(1)}` + (b.eta_full ? ` · bu hızla ${new Date(b.eta_full * 1000).toLocaleString('tr-TR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })} dolar` : '')));
   });
   it.details.forEach(d => kids.push(h('div', { class: 'note' }, d)));
-  if (it.unavailable) kids.push(h('div', { class: 'note' }, unavailText(it)));
+  if (it.unavailable && !it.stale) kids.push(h('div', { class: 'note' }, unavailText(it)));
   if (!it.windows.length && !it.details.length && !it.unavailable) {
     const exhausted = it.accounts.some(a => a.status === 'exhausted');
     kids.push(h('div', { class: 'note' }, exhausted ? 'Limit dolu olduğu için kota bilgisi alınamıyor.' : 'Kota bilgisi alınamadı ya da bu sağlayıcı kota penceresi sunmuyor.'));
@@ -828,7 +835,7 @@ function renderSide(d) {
   // quotas
   const items = (d.quotas.items || []);
   noteQuotaItems(items);
-  const wins = items.flatMap(it => it.windows.map(w => ({ ...w, provider: it.provider })));
+  const wins = items.flatMap(it => it.windows.map(w => ({ ...w, provider: it.provider, stale: it.stale, fetched_at: it.fetched_at })));
   const bad = items.filter(it => it.accounts.some(a => a.status === 'exhausted'));
   if (wins.length || bad.length) {
     parts.push(h('div', {}, h('h5', {}, 'Kotalar', d.quotas.fetched_at ? h('span', {}, ago(d.quotas.fetched_at)) : null),
@@ -838,8 +845,8 @@ function renderSide(d) {
         const short = winName(w.label);
         return h('div', { class: 'sq', title: `${pName(w.provider)} · ${w.label}` },
           h('div', { class: 'r' }, h('span', {}, pShort(w.provider) + ' · ' + short), h('b', {}, fmtPct(p))),
-          h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p}%;background:${tone}` })),
-          h('div', { class: 'sub' }, until(w.reset)));
+          h('div', { class: 'track', style: w.stale ? 'opacity:.55' : '' }, h('div', { class: 'fill', style: `width:${p}%;background:${tone}` })),
+          h('div', { class: 'sub' }, [until(w.reset), w.stale ? 'son değer, ' + ago(w.fetched_at) : null].filter(Boolean).join(' · ')));
       }),
       bad.map(it => h('div', { class: 'sbad' }, h('i'), pName(it.provider) + ' · limit doldu'))));
   }

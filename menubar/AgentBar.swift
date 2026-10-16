@@ -115,6 +115,8 @@ struct Quotas: Decodable { let items: [QuotaItem]? }
 struct QuotaItem: Decodable {
     let provider: String; let accounts: [Account]?; let windows: [QuotaWindow]?
     let accountKey: String?     // set when the account identity was read (one item per real account)
+    // windows are the last known reading, not a fresh one (rate limited / unreadable right now)
+    let stale: Bool?; let fetchedAt: Double?; let unavailableCode: String?; let unavailableHttp: Double?; let retryAt: Double?
 }
 /// One credential in Hermes' pool (several credentials can belong to one account).
 struct Account: Decodable {
@@ -244,6 +246,11 @@ struct HAccount: Decodable {
     let windows: [QuotaWindow]
     let accounts_count: Int?    // accounts behind the credentials (nil = identity not readable for this provider)
     let credentials_count: Int?
+    let stale: Bool?            // the quota windows are the last known reading (see QuotaItem.stale)
+    let fetched_at: Double?
+    let unavailable_code: String?
+    let unavailable_http: Double?
+    let retry_at: Double?
 }
 struct Cred: Decodable {
     let account_key: String?
@@ -1391,6 +1398,11 @@ final class Store: ObservableObject {
             .flatMap { $0.windows ?? [] }.compactMap(\.used).max()
     }
 
+    /// The provider's windows are a last known reading (rate limited ...): rings and rows are drawn dimmed.
+    func isStale(_ provider: String) -> Bool {
+        (live?.quotas?.items ?? []).first { $0.provider == provider }?.stale == true
+    }
+
     /// Every quota window the bar can show, as (key, provider, window).
     var quotaOptions: [(key: String, provider: String, window: QuotaWindow)] {
         (live?.quotas?.items ?? []).flatMap { item in
@@ -1911,11 +1923,17 @@ struct QuotaCard: View {
                      color: creds.contains(where: \.unverified) ? .orange : .secondary)
             }
             let windows = (item.windows ?? []).filter { $0.used != nil }
+            if item.stale == true {
+                Text(staleLine(fetchedAt: item.fetchedAt, code: item.unavailableCode, retryAt: item.retryAt, now: now))
+                    .font(.caption).foregroundStyle(.orange)
+                    .help(item.unavailableHttp.map { L("HTTP \(Int($0)) from the provider", "Sağlayıcıdan HTTP \(Int($0))") } ?? "")
+            }
             if collapsed {
-                ForEach(windows, id: \.label) { w in CompactQuotaRow(window: w, now: now) }
+                ForEach(windows, id: \.label) { w in CompactQuotaRow(window: w, now: now) }.opacity(item.stale == true ? 0.6 : 1)
             } else {
             ForEach(windows, id: \.label) { w in
-                QuotaRow(window: w, burn: burn.first { $0.provider == item.provider && $0.window == w.label }, now: now)
+                QuotaRow(window: w, burn: item.stale == true ? nil : burn.first { $0.provider == item.provider && $0.window == w.label }, now: now)
+                    .opacity(item.stale == true ? 0.6 : 1)
             }
             let pts = history.flatMap { h in
                 h.points.filter { $0.count >= 2 }.map { HistPoint(t: Date(timeIntervalSince1970: $0[0]), window: wName(h.window), used: $0[1]) }
@@ -2374,8 +2392,21 @@ struct HealthTab: View {
     }
 }
 
+/// "last value, 5 min ago · rate limited": shown wherever quota windows are the last known reading.
+func staleLine(fetchedAt: Double?, code: String?, retryAt: Double?, now: Double) -> String {
+    let age = fetchedAt.map { L("last value, \(span(now - $0)) ago", "son değer, \(span(now - $0)) önce") } ?? L("last value", "son değer")
+    let why = code == "rate_limited" ? L("rate limited", "hız sınırı") : L("usage not readable right now", "kullanım şu an okunamıyor")
+    let retry = (code == "rate_limited" ? retryAt : nil).flatMap { $0 > now ? L("retry in \(span($0 - now))", "\(span($0 - now)) sonra yeniden denenecek") : nil }
+    return ([age, why] + (retry.map { [$0] } ?? [])).joined(separator: " · ")
+}
+
 /// /api/health still carries the English reason text (no code field there): render it in the app language.
 func unavailableText(_ u: String) -> String {
+    if u.hasPrefix("rate limited") {
+        let http = u.range(of: #"HTTP \d+"#, options: .regularExpression).map { " (" + u[$0] + ")" } ?? ""
+        return L("Rate limited\(http) — the provider refused the request; showing the last known values",
+                 "Hız sınırı\(http) — sağlayıcı isteği geri çevirdi; son bilinen değerler gösteriliyor")
+    }
     guard u.hasPrefix("usage not readable") else { return u }
     let http = u.range(of: #"HTTP \d+"#, options: .regularExpression).map { " (" + u[$0] + ")" } ?? ""
     return L("Usage not readable\(http) — the credential lacks permission or the provider did not answer",
@@ -2419,7 +2450,10 @@ struct AccountCard: View {
                 Text(L("No profile uses this provider", "Hiçbir profil bu sağlayıcıyı kullanmıyor")).font(.caption).foregroundStyle(.secondary)
             }
             if let p = acc.plan { Text("Plan: \(p)").font(.caption) }
-            if let u = acc.unavailable { Text(unavailableText(u)).font(.caption).foregroundStyle(.secondary) }
+            if acc.stale == true {
+                Text(staleLine(fetchedAt: acc.fetched_at, code: acc.unavailable_code, retryAt: acc.retry_at, now: now))
+                    .font(.caption).foregroundStyle(.orange)
+            } else if let u = acc.unavailable { Text(unavailableText(u)).font(.caption).foregroundStyle(.secondary) }
             ForEach(acc.windows.filter { $0.used != nil }, id: \.label) { w in
                 QuotaRow(window: w, burn: nil, now: now)
             }
@@ -2957,14 +2991,14 @@ struct IslandView: View {
     @AppStorage(Pref.hoverSessions) private var hoverSessions = true
     @AppStorage(Pref.hoverCost) private var hoverCost = true
 
-    var groups: [(provider: String, fractions: [Double])] {
+    var groups: [(provider: String, fractions: [Double], stale: Bool)] {
         var order: [String] = []
         var fr: [String: [Double]] = [:]
         for c in store.chosenQuotas(quotas.split(separator: ",").map(String.init)) {
             if fr[c.provider] == nil { order.append(c.provider) }
             fr[c.provider, default: []].append((c.window.used ?? 0) / 100)
         }
-        return order.prefix(2).map { ($0, fr[$0]!) }
+        return order.prefix(2).map { ($0, fr[$0]!, store.isStale($0)) }
     }
 
     var body: some View {
@@ -3006,6 +3040,8 @@ struct IslandView: View {
             HStack(spacing: 6) {
                 ForEach(groups, id: \.provider) { g in
                     RingGauge(provider: g.provider, fractions: g.fractions, size: 20)
+                        .opacity(g.stale ? 0.55 : 1)
+                        .help(g.stale ? L("Last known value (rate limited)", "Son değer (hız sınırı)") : "")
                         .scaleEffect(island.highlight == g.provider ? 1.3 : 1)
                         .shadow(color: island.highlight == g.provider ? levelColor((g.fractions.first ?? 0) * 100) : .clear, radius: 6)
                 }

@@ -104,7 +104,10 @@ def _accounts(quota_items):
         base, _, key = q["provider"].partition("#")
         if key:
             groups[base].append(key)
-            snap.setdefault(base, {"provider": base, "windows": []})
+            s = snap.setdefault(base, {"provider": base, "windows": []})
+            if q.get("unavailable") and not s.get("unavailable"):  # why a reading is missing / old (e.g. 429)
+                s.update({k: q.get(k) for k in ("unavailable", "unavailable_code", "unavailable_http", "stale",
+                                                "fetched_at", "retry_at")})
             for a in q.get("accounts") or []:
                 unverified = a.get("verification") == "unverified"
                 per_cred[(base, a["label"])] = None if unverified else (q.get("windows") or [])
@@ -145,6 +148,8 @@ def _accounts(quota_items):
                      "accounts_count": n_acc, "credentials_count": len(creds),
                      "account_keys": groups.get(prov, []),
                      "unavailable": q.get("unavailable"), "details": q.get("details") or [],
+                     "unavailable_code": q.get("unavailable_code"), "unavailable_http": q.get("unavailable_http"),
+                     "stale": bool(q.get("stale")), "fetched_at": q.get("fetched_at"), "retry_at": q.get("retry_at"),
                      "windows": q.get("windows") or [], "profiles": [], "fallback_for": []}
     return out
 
@@ -277,7 +282,9 @@ def health(homes, quota_items):
         # (per credential when each account reports its own windows)
         for cred in acc["credentials"]:
             own = cred.pop("windows", None)
-            full = [w for w in (own if own is not None else acc["windows"]) if (w.get("used") or 0) >= 100]
+            # (a window whose reset has passed is an old reading of a window that no longer exists: never locks)
+            full = [w for w in (own if own is not None else acc["windows"])
+                    if (w.get("used") or 0) >= 100 and (not w.get("reset") or w["reset"] > now)]
             # an exhaustion whose lock has lapsed is retried by Hermes on the next request
             cred["locked"] = bool(full) or (
                 cred["status"] == "exhausted" and (cred["exhausted_until"] is None or cred["exhausted_until"] > now))
