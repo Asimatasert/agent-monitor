@@ -1133,7 +1133,9 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
                     post(L("\(who) needs approval", "\(who) onay bekliyor"), title + (s.waitingDetail.map { " — \($0)" } ?? ""), open: s.open)
                 case "stalled":
                     post(L("\(who) may be stuck", "\(who) takılmış olabilir"),
-                         title + L(" — no progress for 30 min", " — 30 dakikadır ilerleme yok"), open: s.open)
+                         title + (s.longToolCall != nil
+                              ? L(" — no progress for 30 min", " — 30 dakikadır ilerleme yok")
+                              : L(" — no progress for 10 min", " — 10 dakikadır ilerleme yok")), open: s.open)
                 default: break
                 }
             }
@@ -2197,7 +2199,7 @@ struct TopSessionsView: View {
                     .help("\(r.profile) · \(r.model ?? "")" + L(" — session total", " — oturum toplamı"))
                     .contextMenu { SessionActions(id: r.id, source: r.source, profile: r.profile) }
             }
-            Text(L("Total cost per session (sessions active in range)", "Oturumun toplam maliyeti (aralıkta aktif olanlar)")).font(.caption2).foregroundStyle(.tertiary)
+            Text(L("Total API-equivalent per session, estimate (sessions active in range)", "Oturumun toplam API karşılığı, tahmini (aralıkta aktif olanlar)")).font(.caption2).foregroundStyle(.tertiary)
         }
     }
 }
@@ -3102,7 +3104,7 @@ struct IslandView: View {
                     }
                 }
                 if hoverCost, let m = store.month {
-                    Text(L("today ", "bugün ") + money(store.spend(m, day: isoDay(0)))).foregroundStyle(.white.opacity(0.8))
+                    Text(L("API-equiv. today ", "bugün API karşılığı ") + money(store.spend(m, day: isoDay(0))) + L(" (est.)", " (tahmini)")).foregroundStyle(.white.opacity(0.8))
                 }
                 Spacer()
                 Text(L("click a row to open it", "satıra tıkla: aç")).foregroundStyle(.white.opacity(0.45))
@@ -3387,7 +3389,7 @@ struct SettingsTab: View {
             Text(L("Hover panel shows", "Üzerine gelince görünenler")).font(.caption).foregroundStyle(.secondary)
             Toggle(L("Quotas", "Kotalar"), isOn: $hoverQuotas)
             Toggle(L("Running sessions", "Çalışan oturumlar"), isOn: $hoverSessions)
-            Toggle(L("Today's cost", "Bugünkü maliyet"), isOn: $hoverCost)
+            Toggle(L("Today's API-equivalent (estimate)", "Bugünkü API karşılığı (tahmini)"), isOn: $hoverCost)
             SegmentRow(title: L("Click opens", "Tıklayınca")) {
                 Picker("", selection: $islandClick) {
                     Text(L("This panel", "Bu panel")).tag("panel")
@@ -3408,7 +3410,7 @@ struct SettingsTab: View {
             Divider()
             budgetField(L("Daily budget", "Günlük bütçe"), $budgetDay)
             budgetField(L("Monthly budget", "Aylık bütçe"), $budgetMonth)
-            Text(L("0 = off · Hermes + CLI estimated API cost", "0 = kapalı · Hermes + CLI tahmini API maliyeti"))
+            Text(L("0 = off · Hermes + CLI estimated API cost", "0 = kapalı · Hermes + CLI tahmini API karşılığı"))
                 .font(.caption2).foregroundStyle(.secondary)
         }
     }

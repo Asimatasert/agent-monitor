@@ -994,7 +994,7 @@ function dailyUsageCard(u, metric = 'tokens') {
   const fmt = metric === 'cost' ? fmtUsd : fmtN;
   const cols = u.daily.map(d => ({ label: dayLabel(d.day), tipTitle: new Date(d.day + 'T00:00').toLocaleDateString('tr-TR', { weekday: 'long', day: 'numeric', month: 'long' }),
     values: Object.fromEntries(Object.entries(d.by).map(([k, v]) => [k, v[metric]])) }));
-  return card(metric === 'cost' ? 'Günlük maliyet' : 'Günlük token', 'sağlayıcıya göre', [legend(series), barChart(cols, series, { fmt })],
+  return card(metric === 'cost' ? 'Günlük API karşılığı (tahmini)' : 'Günlük token', 'sağlayıcıya göre', [legend(series), barChart(cols, series, { fmt })],
     { tableView: () => table([{ label: 'Gün', get: r => dayLabel(r.day) }, ...u.providers.map(p => ({ label: pName(p), n: 1, get: r => fmt(r.by[p]?.[metric]) }))], [...u.daily].reverse()) });
 }
 
@@ -1026,7 +1026,7 @@ function renderOverview(d) {
     kpi('Önbellekten okunan', fmtN(t.cache_read), 'token'));
   const share = card('Sağlayıcı payı', 'token', shareBar(u.by_provider.map(p => ({ label: pName(p.provider), value: p.tokens, color: pColor(p.provider) }))));
   const models = card('En çok kullanılan modeller', 'token', hBars(u.by_model.map(m => ({ label: m.model, value: m.tokens, sub: pName(m.provider), color: pColor(m.provider) }))),
-    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'Sağlayıcı', get: r => pName(r.provider) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) }], u.by_model) });
+    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'Sağlayıcı', get: r => pName(r.provider) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost) }], u.by_model) });
   const agents = card('Profiller', 'token', hBars(u.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) })), { max: 13 }));
   const quotas = card('Kotalar', 'şu an', h('div', { class: 'grid g3' }, (d.quotas.items || []).filter(it => it.windows.length).map(it => quotaCard(it))));
   const k = d.kanban[0];
@@ -1062,7 +1062,7 @@ function renderAccounts(d) {
     { label: 'Kimlik bilgileri', get: r => accountsFor(r.provider) },
     { label: 'Girdi', n: 1, get: r => fmtN(r.input) }, { label: 'Çıktı', n: 1, get: r => fmtN(r.output) },
     { label: 'Önbellek', n: 1, get: r => fmtN(r.cache_read) }, { label: 'API çağrısı', n: 1, get: r => fmtN(r.calls) },
-    { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost) },
     { label: 'Faturalama', get: r => r.mode === 'subscription_included' ? 'abonelik' : r.mode ? 'OAuth / API' : '—' },
   ], u.by_provider));
   const hist = d.history.filter(x => x.points.length);
@@ -1091,7 +1091,7 @@ function renderAgents(d) {
     kpi('Profil', String(list.length), `${active} tanesinde açık oturum var`),
     kpi('Oturum', nfi.format(list.reduce((a, x) => a + x.sessions, 0))),
     kpi('Token', fmtN(list.reduce((a, x) => a + x.tokens, 0))),
-    kpi('Maliyet', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'tahmini'),
+    kpi('API karşılığı (tahmini)', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'abonelikte gerçek harcama değil'),
     kpi('Araç çağrısı', fmtN(list.reduce((a, x) => a + x.tool_calls, 0))));
   const tbl = card('Profiller', 'seçili aralıkta', table([
     { label: 'Profil', get: r => h('div', {}, h('b', {}, r.name), r.error ? h('div', { class: 'err' }, r.error) : null) },
@@ -1099,7 +1099,7 @@ function renderAgents(d) {
     { label: 'Model', get: r => h('div', {}, r.model || '—', h('div', { class: 'sub', style: 'font-size:11.5px' }, pName(r.provider || ''))) },
     { label: 'Günlük', get: r => sparkline(days.map(x => r.daily[x] || 0), pColor(r.provider)) },
     { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'Alt ajan', n: 1, get: r => nfi.format(r.subagents) },
-    { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Araç', n: 1, get: r => fmtN(r.tool_calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Araç', n: 1, get: r => fmtN(r.tool_calls) }, { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost) },
     { label: 'Son aktivite', get: r => h('div', {}, ago(r.last_activity), h('div', { class: 'sub', style: 'font-size:11.5px;max-width:260px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.last_title || '')) },
   ], [...list].sort((a, b) => b.active - a.active || b.tokens - a.tokens)));
   const bars = card('Token dağılımı', '', hBars(list.map(a => ({ label: a.name, value: a.tokens, sub: a.model, color: pColor(a.provider) })), { max: 13 }));
@@ -1120,7 +1120,7 @@ function renderSubagents(d) {
     kpi('Alt ajan', nfi.format(list.length), `${running.length} tanesi şu an çalışıyor`),
     kpi('Ortalama süre', dur(durs.length ? durs.reduce((a, b) => a + b, 0) / durs.length : null)),
     kpi('Token', fmtN(list.reduce((a, x) => a + x.tokens, 0))),
-    kpi('Maliyet', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'tahmini'),
+    kpi('API karşılığı (tahmini)', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'abonelikte gerçek harcama değil'),
     kpi('Araç çağrısı', fmtN(list.reduce((a, x) => a + x.tools, 0))));
   const perDay = Object.fromEntries(d.days.map(x => [x, 0]));
   list.forEach(x => { const k = iso(new Date(x.started * 1000)); if (k in perDay) perDay[k]++; });
@@ -1133,7 +1133,7 @@ function renderSubagents(d) {
     { label: 'Görev', get: r => h('div', { style: 'max-width:380px' }, r.title || '(başlıksız)', h('div', { class: 'sub', style: 'font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.parent ? '↰ ' + r.parent : '')) },
     { label: 'Profil', get: r => r.profile }, { label: 'Model', get: r => r.model || '—' },
     { label: 'Süre', n: 1, get: r => dur(r.duration) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) },
-    { label: 'Araç', n: 1, get: r => nfi.format(r.tools) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
+    { label: 'Araç', n: 1, get: r => nfi.format(r.tools) }, { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost) },
     { label: 'Başladı', get: r => ago(r.started) },
   ], list));
   return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, dayCard, profCard), tbl);
@@ -1172,9 +1172,9 @@ function renderClis(d0) {
   const dayCard = card('Günlük token', 'CLI\'ya göre', [legend(series), barChart(cols, series)],
     { tableView: () => table([{ label: 'Gün', get: r => dayLabel(r.day) }, ...series.map(se => ({ label: se.label, n: 1, get: r => fmtN(r.tokens[se.key]) }))], [...d.daily].reverse()) });
   const costCols = d.daily.map(x => ({ label: dayLabel(x.day), values: x.cost }));
-  const costCard = card('Günlük maliyet', 'tahmini API karşılığı', [legend(series), barChart(costCols, series, { fmt: fmtUsd })]);
+  const costCard = card('Günlük API karşılığı (tahmini)', 'tahmini API karşılığı', [legend(series), barChart(costCols, series, { fmt: fmtUsd })]);
   const models = card('Modeller', 'token', hBars(d.by_model.map(m => ({ label: m.model, value: m.tokens, sub: srcName(m.source) + ' · ' + fmtUsd(m.cost), color: srcColor(m.source) }))),
-    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'CLI', get: r => srcName(r.source) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) }], d.by_model) });
+    { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'CLI', get: r => srcName(r.source) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost) }], d.by_model) });
   const proj = {};
   d.sessions.forEach(x => { const k = (x.project || '—').replace(/^\/Users\/[^/]+/, '~'); (proj[k] ||= { tokens: 0, cost: 0 }); proj[k].tokens += x.tokens; proj[k].cost += x.cost; });
   const projCard = card('Projeler', 'token', hBars(Object.entries(proj).map(([k, v]) => ({ label: k, value: v.tokens, sub: fmtUsd(v.cost) }))));
@@ -1190,7 +1190,7 @@ function renderClis(d0) {
     { label: 'Token', n: 1, get: r => fmtN(r.tokens + (byParent[r.id] || []).reduce((a, x) => a + x.tokens, 0)) },
     { label: 'Önbellek', n: 1, get: r => fmtN(r.cache_read) },
     { label: 'Çağrı', n: 1, get: r => nfi.format(r.calls) },
-    { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost + (byParent[r.id] || []).reduce((a, x) => a + x.cost, 0)) },
+    { label: 'API karşılığı (tahmini)', n: 1, get: r => fmtUsd(r.cost + (byParent[r.id] || []).reduce((a, x) => a + x.cost, 0)) },
     { label: 'Son', get: r => ago(r.last) },
   ], mains));
   const note = h('div', { class: 'note' }, 'Claude Code oturumları da bir Anthropic kotasından yer; hangi hesaba bağlı olduğu ve kota durumu "Hesaplar & Kotalar" sayfasında (Claude Code girişi tek hesap olarak görünür). Token = girdi + çıktı (önbellekten okunan ayrı gösterilir). Gemini / Antigravity ve Factory Droid kullanım kaydı tutmadığı için sadece son hareket gösterilir.');
