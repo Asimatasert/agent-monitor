@@ -19,6 +19,11 @@ CLAUDE_DIR = HOME / ".claude" / "projects"
 CLAUDE_SESSIONS = HOME / ".claude" / "sessions"  # one <pid>.json per open Claude Code process
 COPILOT_DB = HOME / ".copilot" / "session-store.db"
 RUNNING_WINDOW = 120  # a CLI session written to in the last N seconds counts as running
+# Copilot CLI keeps no process registry that we could verify on this machine (~/.copilot is absent here), so an
+# "open" Copilot session is inferred: written to within COPILOT_OPEN_WINDOW, or (best effort, unverified) a live
+# `inuse.<pid>.lock` file in its session-state folder. It is not dropped after RUNNING_WINDOW (2 min).
+COPILOT_OPEN_WINDOW = 900
+COPILOT_STATE = HOME / ".copilot" / "session-state"
 
 SOURCES = {
     "claude-code": "Claude Code",
@@ -242,8 +247,9 @@ def _read_claude_file(path: Path, st):
     return cf
 
 
-def claude_sessions(since):
-    """Every Claude Code transcript (main + subagent) touched since `since`."""
+def claude_sessions(since, always=()):
+    """Every Claude Code transcript (main + subagent) touched since `since`, plus those of the session ids in
+    `always` (open windows stay listed however long they have been quiet)."""
     out = []
     if not CLAUDE_DIR.is_dir():
         return out
@@ -257,7 +263,7 @@ def claude_sessions(since):
                     st = p.stat()
                 except OSError:
                     continue
-                if st.st_mtime < since:
+                if st.st_mtime < since and p.stem not in always and p.parent.parent.name not in always:
                     continue
                 try:
                     cf = _read_claude_file(p, st)
@@ -297,6 +303,17 @@ def copilot_events(start, end):
         ev["cost"] = _cost(ev)
         events.append(ev)
     return events, sessions
+
+
+def _copilot_lock_alive(sid):
+    """Best effort (unverified here): Copilot CLI is believed to leave `inuse.<pid>.lock` in its session folder."""
+    try:
+        for f in (COPILOT_STATE / sid).glob("inuse.*.lock"):
+            if pid_alive(f.name.split(".")[1]):
+                return True
+    except (OSError, IndexError):
+        pass
+    return False
 
 
 # ---------- presence of other CLIs ----------
@@ -348,15 +365,16 @@ def collect(start, end):
     events = []  # (ts, source, model, tokens, cost, subagent)
     opened = claude_open_sessions()
 
-    for path, mtime, cf in claude_sessions(start):
+    for path, mtime, cf in claude_sessions(start, always=opened or ()):
         evs = [e for e in cf.events if start <= e["ts"] < end]
-        if not evs and not (now - mtime < RUNNING_WINDOW):
-            continue
-        tok = sum(e["input"] + e["output"] for e in evs)
-        sid = cf.session if not cf.subagent else path.stem
         # a closed terminal keeps the transcript mtime fresh for a while: the process registry is authoritative
         owner = cf.parent if cf.subagent else cf.session
         is_open = opened is None or owner in opened
+        registered = bool(opened) and owner in opened and not cf.subagent  # open window, however quiet
+        if not evs and not (now - mtime < RUNNING_WINDOW) and not registered:
+            continue
+        tok = sum(e["input"] + e["output"] for e in evs)
+        sid = cf.session if not cf.subagent else path.stem
         reg = (opened or {}).get(owner) or {}
         status = reg.get("status")
         # working = busy on a turn (registry flag), else wrote to its transcript in the last WORKING_WINDOW
@@ -394,11 +412,12 @@ def collect(start, end):
     for sid, evs in by_sess.items():
         meta = cp_sessions.get(sid, {})
         last = _iso_ts(meta.get("updated_at")) or max(e["ts"] for e in evs)
+        is_open = now - last < COPILOT_OPEN_WINDOW or _copilot_lock_alive(sid)
         sessions.append({
             "source": "copilot-cli", "id": sid, "parent": None, "subagent": False,
             "title": meta.get("summary"), "project": meta.get("cwd") or meta.get("repository"),
             "model": evs[-1]["model"], "started": _iso_ts(meta.get("created_at")) or evs[0]["ts"], "last": last,
-            "running": now - last < RUNNING_WINDOW,
+            "running": is_open,
             "working": now - last < WORKING_WINDOW,
             "state": "working" if now - last < WORKING_WINDOW else "waiting", "state_since": last,
             "waiting_for": None, "context_tokens": None, "context_estimated": False, "loop_max": 0,

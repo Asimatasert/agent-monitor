@@ -34,20 +34,26 @@ Hermes' own account-usage helpers, which may refresh an expiring OAuth token whi
 
 ## Features
 
-- **Live** — running sessions and subagents (Hermes, Claude Code, Copilot CLI) grouped by account and profile,
+- **Live** — open sessions and subagents (Hermes, Claude Code, Copilot CLI) grouped by source and profile,
   tokens and cost per minute; each session shows whether it is **working**, **waiting for you**, **needs
-  approval** or looks **stuck**, plus its context size
+  approval** or looks **stuck**, plus its context size. A session counts as *open* while its window is open
+  (Hermes' lease registry, Claude Code's process registry), however quiet it is; every running kanban card is a
+  row too, paired with its worker session. A tool call that runs for minutes shows as working, not stuck.
+  Every row carries an `open` action (session, kanban card, Claude Code, Copilot CLI) — see [docs/api-live.md](docs/api-live.md)
 - **Agent attention** — "finished, your turn" in the notch for the sessions you are using, notifications when an
   agent needs approval, makes no progress for 10+ minutes, repeats the same tool call or carries a very large
   context (unattended workers such as Hermes kanban jobs don't ping you)
 - **Model speed** — median / p90 turn time per model over the last 24 h
 - **Quotas** — per-provider windows (Claude session/week, Codex month, Copilot premium requests) with
-  burn rate and a "fills before reset" forecast; several Claude accounts in Hermes are shown separately,
-  with a hint when one is nearly full and another has room; steady quotas collapse and reopen on every 2 % step
+  burn rate and a "fills before reset" forecast; credentials in Hermes' pool are grouped by the *account* behind
+  them (Anthropic OAuth profile), so two credentials of one Claude account are one entry, while two real
+  accounts are shown separately (with a hint when one is nearly full and another has room); a credential whose
+  account cannot be read (HTTP 403) is listed as unverified, never as an account of its own; steady quotas collapse and reopen on every 2 % step
 - **Health** — per-account status and errors, per-model error rates, and each profile's fallback chain
   (which fallbacks Hermes would actually skip and why)
 - **Usage** — daily/monthly budget with month-end projection, 7-day costs, top models, profiles and sessions
-- **Kanban** — running, blocked and failing cards
+- **Kanban** — running, blocked and failing cards; `blocked` is split into *needs input* and other
+  (`block_kind`), and every card has an `open` action
 - **Notifications** — quota 80/95 % and "filling soon", budget, blocked cards, failing models
 - **Notch island** (MacBooks with a notch): stays invisible until hovered (or always shows rings and the working
   count), peeks beside the camera when a quota moves or a session starts working, pops alerts down from the notch,
@@ -122,19 +128,23 @@ mcp_servers:
 - Reads local data only: Hermes' `~/.hermes` (session databases, credential pool status, profile configs,
   error logs), Claude Code transcripts in `~/.claude/projects`, and Copilot CLI's `~/.copilot/session-store.db`.
   Credentials are only used in memory for the quota requests below and are never stored or returned by the API.
-- The server listens on `127.0.0.1:8777` only, answers only requests addressed to `127.0.0.1`/`localhost`
+- The server listens on `127.0.0.1:8777` only (`AGENT_MONITOR_PORT=<port> ./run.sh` for another port), answers only requests addressed to `127.0.0.1`/`localhost`
   (DNS-rebinding guard) and refuses requests that browsers mark as coming from another site, so other machines
   and web pages can neither read it nor trigger it. A forced quota refresh runs at most every 30 s.
 - Anyone logged in to the same Mac under another account can still reach a localhost port; on a shared Mac,
   quit Agent Bar when you're not using it.
 - Outbound requests are limited to quota/usage lookups with your own credentials: the providers' usage
-  endpoints via Hermes' account-usage helpers (Anthropic, OpenAI Codex, OpenRouter) and GitHub's
+  endpoints via Hermes' account-usage helpers (Anthropic, OpenAI Codex, OpenRouter), Anthropic's OAuth profile
+  endpoint (only to tell which Claude account a pooled credential belongs to; the account id is hashed and never
+  returned) and GitHub's
   `api.github.com/copilot_internal/user` for Copilot (an undocumented endpoint the Copilot clients use;
   it may change without notice).
 - No telemetry. Quota history is kept locally in `panel.db`.
 
 ## Development
 
+- Tests: `"$PY" -m unittest discover -s tests -v` with Hermes' Python (`$PY` = the interpreter `run.sh` picks).
+- Run a throw-away server next to the real one: `AGENT_MONITOR_PORT=18777 ./run.sh`.
 - Restart the server after Python changes: stop the `panel.py` listener on :8777, then `./run.sh`
   (Agent Bar restarts it on its own within seconds if *Start the dashboard server* is on).
 - `./make-screenshots.sh <dir> [live quota health health-models health-chains usage kanban settings]` renders

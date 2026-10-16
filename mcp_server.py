@@ -66,12 +66,14 @@ def when(ts: float | None) -> dict | None:
 
 def usable_providers(health: dict) -> dict[str, bool]:
     """provider -> has at least one credential that isn't locked (limit reached / quota window full).
-    Per-account ids ("anthropic#work") get their own entry from that credential."""
+    Per-account ids ("anthropic#<account-key>") get their own entry: usable when any credential of that account is."""
     out = {}
     for a in health["accounts"]:
         out[a["provider"]] = any(not c.get("locked") for c in a["credentials"])
         for c in a["credentials"]:
-            out[f"{a['provider']}#{c['label']}"] = not c.get("locked")
+            if c.get("account_key"):
+                key = f"{a['provider']}#{c['account_key']}"
+                out[key] = out.get(key, False) or not c.get("locked")
     return out
 
 

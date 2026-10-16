@@ -3,11 +3,15 @@
 
 Reads Hermes data read-only. The only writes go to the panel's own panel.db (quota history).
 Start with ./run.sh, which uses the same Python runtime as Hermes itself.
-Then open http://127.0.0.1:8777
+Then open http://127.0.0.1:8777 (AGENT_MONITOR_PORT=<port> ./run.sh to listen elsewhere).
 """
 import concurrent.futures
+import hashlib
 import json
+import os
+import re
 import resource
+import shlex
 import sqlite3
 import sys
 import threading
@@ -17,7 +21,7 @@ from contextlib import contextmanager
 from datetime import date, datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, quote, urlparse
 
 HOME = Path.home() / ".hermes"
 sys.path.insert(0, str(HOME / "hermes-agent"))
@@ -27,7 +31,10 @@ sys.path.insert(0, str(Path(__file__).parent))
 import clis  # noqa: E402
 import health  # noqa: E402
 
-PORT = 8777
+try:
+    PORT = int(os.environ.get("AGENT_MONITOR_PORT") or 8777)
+except ValueError:
+    PORT = 8777
 HERE = Path(__file__).parent
 PANEL_DB = HERE / "panel.db"
 QUOTA_TTL = 120          # provider usage APIs are cached this many seconds
@@ -212,9 +219,84 @@ def _anthropic_windows(token):
     return windows
 
 
+ANTHROPIC_PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
+_anthropic_aliases = {}  # old quota_history provider id -> current "anthropic#<account-key>" (see quota_history)
+
+
+def _anthropic_identity(token):
+    """Account key of a Claude OAuth credential, or None when it cannot be read.
+
+    Source: Anthropic's OAuth profile endpoint (GET https://api.anthropic.com/api/oauth/profile, the one Claude Code
+    itself calls). Its answer carries `account.uuid` (and `organization.uuid`); the key is the first 8 hex digits of
+    sha256(account uuid), so the raw id never leaves this process. Tokens without the `user:profile` scope (e.g. a
+    setup token in ANTHROPIC_TOKEN) get HTTP 403 and stay unreadable (None) — never guessed from the label."""
+    import httpx
+
+    try:
+        r = httpx.get(ANTHROPIC_PROFILE_URL, timeout=15,
+                      headers={"Authorization": f"Bearer {token}", "Accept": "application/json",
+                               "anthropic-beta": "oauth-2025-04-20", "User-Agent": "claude-code/2.1.0"})
+        r.raise_for_status()
+        uid = ((r.json() or {}).get("account") or {}).get("uuid")
+    except Exception:
+        return None
+    return hashlib.sha256(str(uid).encode()).hexdigest()[:8] if uid else None
+
+
+def _windows_sig(wins):
+    """Fingerprint of a credential's usage windows: equal only when every window matches to the digit."""
+    return tuple(sorted((w["label"], round(w["used"], 4), round(w["reset"] or 0)) for w in wins))
+
+
+def _group_anthropic(creds):
+    """Group pooled Claude credentials by the account behind them -> list of quota items.
+
+    creds: [{"e": pool entry (label/source/...), "key": account key | None, "wins": [...], "err": str | None,
+             "http": int | None}]
+    1. identity readable           -> grouped by account key;
+    2. identity unreadable but the usage windows are readable -> joins the group whose windows are identical to the
+       digit (same account, same moment), else stays its own item (key = hash of the windows);
+    3. nothing readable (403/timeout) -> never its own item: listed as "unverified" under the first item, or, when no
+       credential at all is readable, all together under one plain "anthropic" item."""
+    groups = {}  # key -> {"creds": [...], "wins": [...], "err": ...}
+    unreadable = []
+    for c in creds:
+        if c["key"]:
+            g = groups.setdefault(c["key"], {"creds": [], "wins": [], "err": None})
+            g["creds"].append(dict(c, status_of="verified"))
+            if c["wins"] and not g["wins"]:
+                g["wins"] = c["wins"]
+            if c["err"] and not c["wins"]:
+                g["err"] = g["err"] or c["err"]
+    for c in creds:
+        if c["key"]:
+            continue
+        if c["wins"]:
+            sig = _windows_sig(c["wins"])
+            hit = next((g for g in groups.values() if g["wins"] and _windows_sig(g["wins"]) == sig), None)
+            if hit is not None:
+                hit["creds"].append(dict(c, status_of="same_windows"))
+            else:
+                k = "w" + hashlib.sha256(repr(sig).encode()).hexdigest()[:7]
+                g = groups.setdefault(k, {"creds": [], "wins": c["wins"], "err": None})
+                g["creds"].append(dict(c, status_of="same_windows" if g["creds"] else "windows_only"))
+        else:
+            unreadable.append(c)
+    if unreadable and not groups:
+        # nothing is readable: one plain item holds every credential
+        return [{"key": None, "creds": [dict(c, status_of="unverified") for c in unreadable], "wins": [],
+                 "err": next((c["err"] for c in unreadable if c["err"]), None),
+                 "http": next((c["http"] for c in unreadable if c["http"]), None)}]
+    if unreadable:
+        first = next(iter(groups.values()))
+        first["creds"] += [dict(c, status_of="unverified") for c in unreadable]
+    return [dict(g, key=k) for k, g in groups.items()]
+
+
 def _anthropic_account_items():
-    """With several Claude OAuth accounts in Hermes' pool, one quota item per account (provider id
-    "anthropic#<label>"), each read with that account's own token; None when there is only one."""
+    """Claude OAuth credentials in Hermes' pool grouped by the ACCOUNT behind them (provider id
+    "anthropic#<account-key>"), each read with its own token; None when the pool has fewer than 2 OAuth entries.
+    Two credentials of one account (e.g. ANTHROPIC_TOKEN + claude_code) become ONE item with both in `accounts`."""
     from agent.credential_pool import load_pool
 
     entries = [e for e in load_pool("anthropic").entries() if e.auth_type == "oauth"]
@@ -222,20 +304,43 @@ def _anthropic_account_items():
         return None
 
     def one(e):
+        key = _anthropic_identity(e.runtime_api_key)
         try:
-            return [{"label": w.label, "used": w.used_percent, "reset": w.reset_at.timestamp() if w.reset_at else None,
-                     "detail": None} for w in _anthropic_windows(e.runtime_api_key)], None
+            wins = [{"label": w.label, "used": w.used_percent, "reset": w.reset_at.timestamp() if w.reset_at else None,
+                     "detail": None} for w in _anthropic_windows(e.runtime_api_key)]
+            return {"e": e, "key": key, "wins": wins, "err": None, "http": None}
         except Exception as ex:  # an expired token is refreshed by Hermes on its next use of that account
             code = getattr(getattr(ex, "response", None), "status_code", None)
-            return [], f"usage not readable right now (HTTP {code})" if code else "usage not readable right now"
+            return {"e": e, "key": key, "wins": [], "err": "usage not readable right now", "http": code}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-        results = list(pool.map(one, entries))
-    return [{"provider": f"anthropic#{e.label}",
-             "accounts": [{"label": e.label, "source": e.source, "status": e.last_status,
-                           "requests": e.request_count, "priority": e.priority}],
-             "windows": wins, "details": [], "plan": None, "unavailable": err}
-            for e, (wins, err) in zip(entries, results)]
+        creds = list(pool.map(one, entries))
+    items = []
+    for g in _group_anthropic(creds):
+        accs = []
+        for c in g["creds"]:
+            e = c["e"]
+            acc = {"label": e.label, "source": e.source, "status": e.last_status, "requests": e.request_count,
+                   "priority": e.priority, "account_key": c["key"] or (g["key"] if c["status_of"] != "unverified" else None)}
+            if c["status_of"] == "unverified":
+                # listed with the item, but nothing says it is the same account: no account_key of its own
+                # (reason code; clients translate)
+                acc.update(verification="unverified", reason="usage_unreadable", http=c["http"], listed_under=g["key"])
+            else:
+                acc["verification"] = c["status_of"]
+            accs.append(acc)
+        accs.sort(key=lambda a: (a["priority"] if a["priority"] is not None else 99, a["label"] or ""))
+        err = None if g["wins"] else (g["err"] or None)
+        items.append({"provider": f"anthropic#{g['key']}" if g["key"] else "anthropic",
+                      "account_key": g["key"], "accounts": accs, "windows": g["wins"], "details": [], "plan": None,
+                      "unavailable": (f"{err} (HTTP {g['http']})" if g.get("http") else err) if err else None,
+                      "unavailable_code": "usage_unreadable" if err else None,
+                      "unavailable_http": g.get("http") if err else None})
+        for c in g["creds"]:  # history written under the old per-label ids follows the account
+            _anthropic_aliases[f"anthropic#{c['e'].label}"] = items[-1]["provider"]
+    if len(items) == 1:  # one account: every older anthropic series belongs to it
+        _anthropic_aliases["anthropic"] = items[0]["provider"]
+    return items
 
 
 def _usage_snapshot(prov):
@@ -382,8 +487,9 @@ def quota_history(start, end):
                             WHERE ts >= ? AND ts < ? ORDER BY ts""", (start, end)).fetchall()
     series = defaultdict(list)
     for ts, prov, win, used in rows:
-        series[(prov, win)].append([ts, used])
-    return [{"provider": p, "window": w, "points": pts} for (p, w), pts in series.items()]
+        # an account's key replaced the old per-label id: keep the old series under the current one
+        series[(_anthropic_aliases.get(prov, prov), win)].append([ts, used])
+    return [{"provider": p, "window": w, "points": sorted(pts)} for (p, w), pts in series.items()]
 
 
 def _quota_recorder():
@@ -473,6 +579,37 @@ def usage(start, end, days, profile=None):
     }
 
 
+# ---------- open sessions (lease registry) ----------
+
+LEASED_SOURCES = ("cli", "desktop", "tui")  # surfaces that hold a lease while their window is open
+SUBAGENT_OPEN_WINDOW = 3600  # a subagent of an open session, not ended, stays listed while it wrote within this
+
+
+def open_leases(home: Path):
+    """{session id: pid} of the chat surfaces open right now (Hermes' own lease registry, live pid only).
+    Kanban workers hold a lease too (its pid is the card's worker_pid)."""
+    try:
+        entries = json.loads((home / "runtime" / "active_sessions.json").read_text()).get("entries") or []
+    except (OSError, ValueError, AttributeError):
+        return {}
+    return {e.get("session_id"): e.get("pid") for e in entries
+            if isinstance(e, dict) and e.get("session_id") and clis.pid_alive(e.get("pid"))}
+
+
+def open_sessions(home: Path):
+    """Session ids whose chat surface is open right now."""
+    return set(open_leases(home))
+
+
+def main_is_open(source, sid, last, opened, now):
+    """The one definition of "this main session is open" (Live, Agents page): an unended session of a leased surface
+    (desktop/cli/tui) is open exactly while its lease is live, however quiet it is; any other source (kanban worker,
+    messaging platforms, cron...) is open while it holds a lease or wrote within ACTIVE_WINDOW."""
+    if source in LEASED_SOURCES:
+        return sid in opened
+    return sid in opened or (last or 0) > now - ACTIVE_WINDOW
+
+
 # ---------- agents & subagents ----------
 
 def agents(start, end):
@@ -501,9 +638,11 @@ def agents(start, end):
                            ORDER BY coalesce(last_activity_at, started_at) DESC LIMIT 1""").fetchone()
                     if last:
                         row["last_activity"], row["last_title"] = num(last["t"]), last["title"]
-                    row["active"] = c.execute(
-                        """SELECT count(*) FROM sessions WHERE ended_at IS NULL
-                           AND coalesce(last_activity_at, started_at) > ?""", (now - ACTIVE_WINDOW,)).fetchone()[0]
+                    opened = open_sessions(home)
+                    row["active"] = sum(1 for r in c.execute(
+                        """SELECT id, source, coalesce(last_activity_at, started_at) t FROM sessions
+                           WHERE ended_at IS NULL AND parent_session_id IS NULL""")
+                        if main_is_open(r["source"], r["id"], num(r["t"]), opened, now))
             except sqlite3.Error as e:
                 row["error"] = str(e)
         out.append(row)
@@ -518,9 +657,11 @@ def subagents(start, end):
         if not db.exists():
             continue
         try:
+            opened = open_sessions(home)
             with ro(db) as c:
                 for s in c.execute(
                         f"""SELECT s.title, s.model, s.started_at, s.ended_at, s.end_reason,
+                                   s.parent_session_id parent_id, p.source psource,
                                    coalesce(s.last_activity_at, s.started_at) t,
                                    coalesce(s.input_tokens,0)+coalesce(s.output_tokens,0) tok,
                                    {cost_expr('s.')} cost, coalesce(s.tool_call_count,0) tools,
@@ -530,12 +671,15 @@ def subagents(start, end):
                             ORDER BY s.started_at DESC LIMIT 300""", (start, end)):
                     t = num(s["t"]) or 0
                     running = s["ended_at"] is None and t > now - ACTIVE_WINDOW
+                    if s["psource"] in LEASED_SOURCES and s["parent_id"] not in opened:
+                        running = False  # its parent window is closed (same rule as Live)
                     started = num(s["started_at"])
                     ended = num(s["ended_at"]) or t
                     out.append({"profile": name, "title": s["title"], "model": s["model"],
                                 "parent": s["parent"], "started": started, "last": t,
                                 "duration": (ended - started) if started else None,
-                                "status": "running" if running else (s["end_reason"] or "ended"),
+                                "status": "running" if running else "ended",
+                                "end_reason": None if running else s["end_reason"],
                                 "tokens": s["tok"], "cost": s["cost"], "tools": s["tools"],
                                 "activity": s["act"]})
         except sqlite3.Error:
@@ -546,12 +690,28 @@ def subagents(start, end):
 
 # ---------- kanban ----------
 
-def kanban(start, end, days):
+def kanban_dbs():
     dbs = [("default", HOME / "kanban.db")]
     boards = HOME / "kanban" / "boards"
     if boards.is_dir():
         dbs += [(b.name, b / "kanban.db") for b in sorted(boards.iterdir()) if (b / "kanban.db").exists()]
+    return dbs
+
+
+def _task_cols(c):
+    return {r[1] for r in c.execute("PRAGMA table_info(tasks)")}
+
+
+def card_waiting_for(status, block_kind):
+    """What a card waits for: input (blocked + needs_input), review (status review), else None."""
+    if status == "blocked" and block_kind == "needs_input":
+        return "input"
+    return "review" if status == "review" else None
+
+
+def kanban(start, end, days):
     out = []
+    dbs = kanban_dbs()
     for board, db in dbs:
         if not db.exists():
             continue
@@ -569,14 +729,23 @@ def kanban(start, end, days):
                 for r in c.execute("""SELECT assignee, status FROM tasks
                                       WHERE status NOT IN ('done','archived')"""):
                     by_assignee[r[0] or "atanmamış"][r[1]] += 1
+                bk = "block_kind" if "block_kind" in _task_cols(c) else "NULL AS block_kind"
                 cards = [dict(r) for r in c.execute(
-                    """SELECT id, title, assignee, status, priority, created_at, started_at, completed_at,
-                              last_heartbeat_at, consecutive_failures, last_failure_error
+                    f"""SELECT id, title, assignee, status, priority, created_at, started_at, completed_at,
+                              last_heartbeat_at, consecutive_failures, last_failure_error, {bk}
                        FROM tasks WHERE status != 'archived'
                          AND (status != 'done' OR (completed_at >= ? AND completed_at < ?))
                        ORDER BY coalesce(completed_at, started_at, created_at) DESC LIMIT 400""",
                     (start, end))]
-            out.append({"board": board, "counts": counts, "cards": cards,
+                # blocked is not one thing: needs_input waits for a person, the rest waits for a dependency / something else
+                blocked_by_kind = defaultdict(int)
+                for r in c.execute(f"SELECT {bk} FROM tasks WHERE status = 'blocked'"):
+                    blocked_by_kind[r[0] or "other"] += 1
+            for card in cards:
+                card["board"] = board
+                card["waiting_for"] = card_waiting_for(card["status"], card["block_kind"])
+                card["open"] = open_kanban_card(card["id"], board, card["title"])
+            out.append({"board": board, "counts": counts, "blocked_by_kind": dict(blocked_by_kind), "cards": cards,
                         "done_daily": [{"day": d, "done": done_daily.get(d, 0)} for d in days],
                         "by_assignee": [{"assignee": a, **v} for a, v in
                                         sorted(by_assignee.items(), key=lambda kv: -sum(kv[1].values()))]})
@@ -586,30 +755,138 @@ def kanban(start, end, days):
     return out
 
 
-def kanban_by_assignee():
-    """{assignee: (title, status)} — the active card each agent is on, for live session rows.
-    The match is assignee==profile (Hermes assigns one agent per profile); prefers a 'running' card,
-    then blocked/ready/todo/triage. Returns {} when there are no boards or no open cards."""
-    rank = {"running": 0, "blocked": 1, "ready": 2, "todo": 3, "triage": 4}
-    best = {}  # assignee -> (rank, title, status)
-    dbs = [HOME / "kanban.db"]
-    boards = HOME / "kanban" / "boards"
-    if boards.is_dir():
-        dbs += [b / "kanban.db" for b in sorted(boards.iterdir()) if (b / "kanban.db").exists()]
-    for db in dbs:
+def kanban_cards():
+    """{card id: {...}} every non-archived card on every board, read-only from Hermes' kanban DB."""
+    out = {}
+    for board, db in kanban_dbs():
         if not db.exists():
             continue
         try:
             with ro(db) as c:
-                for r in c.execute("""SELECT assignee, status, title FROM tasks
-                                      WHERE assignee IS NOT NULL AND status NOT IN ('done','archived')"""):
-                    a, st, title = r["assignee"], r["status"], r["title"]
-                    rk = rank.get(st, 9)
-                    if a not in best or rk < best[a][0]:
-                        best[a] = (rk, title, st)
+                cols = _task_cols(c)
+                bk = "block_kind" if "block_kind" in cols else "NULL AS block_kind"
+                for r in c.execute(f"""SELECT id, title, assignee, status, started_at, last_heartbeat_at, worker_pid,
+                                              {bk} FROM tasks WHERE status != 'archived'"""):
+                    out[r["id"]] = {"id": r["id"], "board": board, "title": r["title"], "assignee": r["assignee"],
+                                    "status": r["status"], "started_at": num(r["started_at"]),
+                                    "heartbeat": num(r["last_heartbeat_at"]), "worker_pid": r["worker_pid"],
+                                    "block_kind": r["block_kind"]}
         except sqlite3.Error:
             continue
-    return {a: (title, st) for a, (_, title, st) in best.items()}
+    return out
+
+
+# ---------- "open" action (contract: docs/api-live.md) ----------
+
+HERMES_APPS = (Path("/Applications/Hermes.app"), Path.home() / "Applications" / "Hermes.app")
+HERMES_KANBAN_URL = "hermes://open/kanban"  # board page; Hermes has no per-card route (read from its source)
+
+
+def hermes_desktop_installed():
+    """The hermes:// scheme is registered by Hermes.app (CFBundleURLSchemes); without it a URL goes nowhere."""
+    return any(p.exists() for p in HERMES_APPS)
+
+
+def _label(text, fallback):
+    t = " ".join(str(text or "").split()) or fallback
+    return t if len(t) <= 80 else t[:79] + "…"
+
+
+def open_hermes_session(profile, sid, source, title):
+    """Hermes session. `hermes -p <profile> --resume <id>` always works (checked with `hermes --help`).
+    `hermes://open/<id>` is only offered for desktop sessions with Hermes.app installed: the desktop app maps it to its
+    chat route /<id> (apps/desktop: hermes-open-target.ts, routes.ts, read in source, not run). It carries no profile,
+    so for other surfaces and other profiles' CLI sessions the command is the only claim made."""
+    cmd = "hermes " + (f"-p {shlex.quote(profile)} " if profile and profile != "default" else "") \
+          + f"--resume {shlex.quote(sid)}"
+    url = f"hermes://open/{quote(sid, safe='')}" if source == "desktop" and hermes_desktop_installed() else None
+    return {"kind": "hermes-session", "url": url, "command": cmd, "label": _label(title, sid)}
+
+
+def open_kanban_card(card_id, board, title, session_cmd=None):
+    """Kanban card: board page + a command that prints the card (`hermes kanban [--board <b>] show <id>`; --board is a
+    flag of `kanban`, so it goes before the verb)."""
+    cmd = "hermes kanban " + (f"--board {shlex.quote(board)} " if board and board != "default" else "") \
+          + f"show {shlex.quote(card_id)}"
+    out = {"kind": "kanban-card", "url": HERMES_KANBAN_URL if hermes_desktop_installed() else None,
+           "command": cmd, "label": _label(title, card_id), "card_id": card_id}
+    if session_cmd:
+        out["session_command"] = session_cmd
+    return out
+
+
+def open_cli_session(kind, sid, project, title):
+    """Claude Code / Copilot CLI: no URL scheme known, so a command. Claude Code looks a session up under the current
+    directory's project, hence the `cd`."""
+    binary = "claude" if kind == "claude-code" else "copilot"
+    cmd = f"{binary} --resume {shlex.quote(sid)}"
+    if kind == "claude-code" and project:
+        cmd = f"cd {shlex.quote(project)} && {cmd}"
+    return {"kind": kind, "url": None, "command": cmd, "label": _label(title, sid)}
+
+
+NO_OPEN = {"kind": "none", "url": None, "command": None, "label": ""}
+
+
+KANBAN_PROMPT = re.compile(r"kanban task (t_[0-9a-f]+)")
+
+
+def match_kanban_sessions(rows, cards):
+    """Pair kanban worker sessions with their card (never by profile alone). Order of evidence:
+    1. the session's lease pid == the card's worker_pid (the dispatcher spawns the worker process that holds the lease);
+    2. the task id in the session's first user message ("work kanban task <id>", what the dispatcher sends);
+    3. same assignee/profile, same title, started no earlier than 2 min before the card.
+    `tasks.session_id` is NOT used: it is the session that created the card. A card pairs with at most one session."""
+    taken = set()
+
+    def take(r, card):
+        r["kanban"] = {"id": card["id"], "board": card["board"], "status": card["status"], "title": card["title"],
+                       "block_kind": card["block_kind"]}
+        r["kanban_card"], r["kanban_status"] = card["title"], card["status"]
+        taken.add(card["id"])
+
+    work = [r for r in rows if r.get("origin") == "kanban" and not r["subagent"]]
+    left = []
+    for r in work:
+        pid = r.get("_pid")
+        card = next((c for c in cards.values() if pid and c["worker_pid"] == pid and c["id"] not in taken
+                     and c["status"] == "running"), None)
+        if card:
+            take(r, card)
+        else:
+            left.append(r)
+    rest = []
+    for r in left:
+        m = KANBAN_PROMPT.search(r.get("_first_user") or "")
+        card = cards.get(m.group(1)) if m else None
+        if card and card["id"] not in taken:
+            take(r, card)
+        else:
+            rest.append(r)
+    for r in rest:
+        card = next((c for c in cards.values() if c["id"] not in taken and c["status"] == "running"
+                     and c["assignee"] == r["profile"] and c["title"] == r["title"]
+                     and (r["started"] or 0) >= (c["started_at"] or 0) - 120), None)
+        if card:
+            take(r, card)
+    return taken
+
+
+def card_only_row(card, now):
+    """Live row for a running card whose worker session could not be paired (or is not listed): a running card is
+    always visible. state: working while the worker process lives, stalled when it is gone."""
+    alive = bool(card["worker_pid"]) and clis.pid_alive(card["worker_pid"])
+    last = max(card["heartbeat"] or 0, card["started_at"] or 0) or None
+    return {"id": card["id"], "card_only": True, "parent": None, "parent_title": None, "profile": card["assignee"],
+            "title": card["title"], "model": None, "provider": "", "started": card["started_at"], "last": last,
+            "subagent": False, "status": "running", "end_reason": None, "working": alive, "activity": None,
+            "tokens": 0, "cost": 0.0, "tools": 0, "messages": 0, "parent_model": None, "origin": "kanban",
+            "interactive": False, "state": "working" if alive else "stalled", "state_since": None if alive else last,
+            "waiting_for": None, "context_tokens": None, "context_estimated": True, "loop_max": 0,
+            "kind": "hermes", "source_name": "Hermes",
+            "kanban": {"id": card["id"], "board": card["board"], "status": card["status"], "title": card["title"],
+                       "block_kind": card["block_kind"]},
+            "kanban_card": card["title"], "kanban_status": card["status"]}
 
 
 # ---------- live ----------
@@ -678,20 +955,12 @@ def token_rate():
     return {"since": samples[0][0] if samples else None, "minutes": minutes, "by_profile": by_profile}
 
 
-LEASED_SOURCES = ("cli", "desktop", "tui")  # surfaces that hold a lease while their window is open
-
-
-def open_sessions(home: Path):
-    """Session ids whose chat surface is open right now (Hermes' own lease registry, live pid only)."""
-    try:
-        entries = json.loads((home / "runtime" / "active_sessions.json").read_text()).get("entries") or []
-    except (OSError, ValueError, AttributeError):
-        return set()
-    return {e.get("session_id") for e in entries if isinstance(e, dict) and clis.pid_alive(e.get("pid"))}
-
-
 INTERACTIVE_SOURCES = ("desktop", "cli", "tui", "telegram", "slack", "discord")
 STALL_AFTER = 600  # a turn that claims to be running but wrote nothing for this long is "stalled"
+STALL_AFTER_TOOL = 1800  # ... but a tool call still in flight (a build, a test run) gets this long
+# Hermes states a pending command approval only through its activity label ("waiting for user approval (32s
+# elapsed)"); there is no structured field, so this text match is the one fragile spot (S-08).
+APPROVAL_MARK = "approval"
 
 
 def _hermes_state(c, sid, act, now):
@@ -699,19 +968,28 @@ def _hermes_state(c, sid, act, now):
     working: a live turn lease or an activity label (Hermes clears it when a turn ends);
     waiting: last message is a final assistant reply (no tool calls) and no turn is running;
     stalled: a turn claims to run (or was cut mid-turn) but nothing was written for STALL_AFTER."""
-    last = c.execute("""SELECT role, tool_calls IS NULL final, timestamp FROM messages
+    last = c.execute("""SELECT role, tool_calls IS NULL final, timestamp, tool_calls FROM messages
                         WHERE session_id = ? AND active = 1 ORDER BY id DESC LIMIT 1""", (sid,)).fetchone()
+    # last message is an assistant turn with tool calls and no result yet: a tool call is running, not stuck
+    pending_tool = None
+    if last and last["role"] == "assistant" and last["tool_calls"]:
+        try:
+            names = [(t.get("function") or {}).get("name") for t in json.loads(last["tool_calls"])]
+            pending_tool = ", ".join(n for n in names if n) or "tool"
+        except (ValueError, AttributeError, TypeError):
+            pending_tool = "tool"
+    stall_after = STALL_AFTER_TOOL if pending_tool else STALL_AFTER
     lease = c.execute("SELECT 1 FROM session_turn_leases WHERE conversation_id = ? AND expires_at > ?",
                       (sid, now)).fetchone() is not None
     last_ts = num(last["timestamp"]) if last else None
     quiet = now - (last_ts or now)
-    if act and "approval" in act.lower():
+    if act and APPROVAL_MARK in act.lower():
         state, since = "needs_approval", None  # e.g. "waiting for user approval (32s elapsed)"
     elif lease or act:
-        state, since = ("stalled", last_ts) if quiet > STALL_AFTER else ("working", None)
+        state, since = ("stalled", last_ts) if quiet > stall_after else ("working", None)
     elif last and last["role"] == "assistant" and last["final"]:
         state, since = "waiting", last_ts
-    elif last and quiet > STALL_AFTER:
+    elif last and quiet > stall_after:
         state, since = "stalled", last_ts  # cut off mid-turn
     else:
         state, since = "working", None
@@ -730,7 +1008,9 @@ def _hermes_state(c, sid, act, now):
                      (sid, now - 1800)).fetchone()[0] or 0
     return {"state": state, "state_since": since, "context_tokens": int(size / 4) if size else None,
             "context_estimated": True, "loop_max": loop,
-            "waiting_for": "approval" if state == "needs_approval" else None}
+            "waiting_for": "approval" if state == "needs_approval" else None,
+            # name(s) of the tool call in flight, when the session is working/stalled on one (clients phrase it)
+            "long_tool_call": pending_tool if state in ("working", "stalled") and quiet > 60 else None}
 
 
 _speed_cache = {"at": 0.0, "data": []}
@@ -796,6 +1076,36 @@ def model_speed(since):
                    for (src, m), v in rows.items() if v["dur"]), key=lambda x: -x["turns"])
 
 
+def _open_for(r, by_id):
+    """The `open` object of one Live row (contract: docs/api-live.md)."""
+    if r.get("kanban"):
+        k = r["kanban"]
+        sess = None if r.get("card_only") else open_hermes_session(r["profile"], r["id"], r["origin"], r["title"])
+        return open_kanban_card(k["id"], k["board"], k["title"], sess["command"] if sess else None)
+    if r["subagent"]:  # a subagent has no window of its own: open its parent
+        parent = by_id.get((r["profile"], r["parent"]))
+        if r["kind"] == "hermes" and r.get("_psource"):
+            return open_hermes_session(r["profile"], r["parent"], r["_psource"], r.get("parent_title"))
+        if r["kind"] == "claude-code" and r["parent"]:
+            return open_cli_session("claude-code", r["parent"], parent and parent.get("_project") or r.get("_project"),
+                                    parent and parent.get("title"))
+        return dict(NO_OPEN)
+    if r["kind"] == "hermes":
+        return open_hermes_session(r["profile"], r["id"], r["origin"], r["title"])
+    if r["kind"] in ("claude-code", "copilot-cli"):
+        return open_cli_session(r["kind"], r["id"], r.get("_project"), r["title"])
+    return dict(NO_OPEN)
+
+
+def live_counts(rows):
+    """One counting rule for every surface: open main sessions (+ card-only kanban rows) by state; subagents apart."""
+    main = [r for r in rows if r["status"] == "running" and not r["subagent"]]
+    n = lambda st: sum(1 for r in main if r["state"] == st)
+    return {"open": len(main), "working": n("working"), "needs_approval": n("needs_approval"),
+            "your_turn": n("waiting"), "stalled": n("stalled"),
+            "subagents": sum(1 for r in rows if r["status"] == "running" and r["subagent"])}
+
+
 def live():
     now = time.time()
     cur = int(now // 60) * 60
@@ -807,7 +1117,8 @@ def live():
         if not db.exists():
             continue
         try:
-            opened = open_sessions(home)
+            leases = open_leases(home)
+            opened = set(leases)
             with ro(db) as c:
                 recent = [r[0] for r in c.execute(
                     "SELECT id FROM sessions WHERE coalesce(last_activity_at, started_at) >= ?", (mins[0],))]
@@ -817,7 +1128,13 @@ def live():
                         m = int(r[0] // 60) * 60
                         if m in activity and r[1] in activity[m]:
                             activity[m][r[1]] += 1
-                # running sessions + subagents that finished in the last 15 min (so the tree keeps context)
+                # Open sessions come from Hermes' lease registry, not from recent activity: an unended session whose
+                # lease is live is listed however quiet it is. The ACTIVE_WINDOW rule stays for sources without a
+                # lease (messaging platforms, cron...). Subagents that finished in the last 15 min stay for context.
+                held = list(opened)
+                hold = ",".join("?" * len(held))
+                in_open = f"id IN ({hold})" if held else "0"
+                sub_open = f"parent_session_id IN ({hold})" if held else "0"
                 for s in c.execute(
                         f"""SELECT id, parent_session_id parent, title, model, started_at, ended_at, end_reason,
                                    (SELECT p.title FROM sessions p WHERE p.id = sessions.parent_session_id) ptitle,
@@ -828,32 +1145,48 @@ def live():
                                    (SELECT p.source FROM sessions p WHERE p.id = sessions.parent_session_id) psource,
                                    (SELECT p.model FROM sessions p WHERE p.id = sessions.parent_session_id) pmodel
                             FROM sessions
-                            WHERE (ended_at IS NULL AND coalesce(last_activity_at, started_at) > ?)
+                            WHERE (ended_at IS NULL AND (coalesce(last_activity_at, started_at) > ? OR {in_open}))
+                               OR (ended_at IS NULL AND {sub_open} AND coalesce(last_activity_at, started_at) > ?)
                                OR (parent_session_id IS NOT NULL AND coalesce(ended_at, last_activity_at) > ?)""",
-                        (now - ACTIVE_WINDOW, now - 900)):
-                    is_running = s["ended_at"] is None and (num(s["t"]) or 0) > now - ACTIVE_WINDOW
-                    # a closed window leaves ended_at unset until Hermes reaps it: trust the lease registry
-                    if s["parent"] is None and s["source"] in LEASED_SOURCES and s["id"] not in opened:
-                        continue
-                    if s["parent"] is not None and s["psource"] in LEASED_SOURCES and s["parent"] not in opened:
-                        is_running = False
+                        (now - ACTIVE_WINDOW, *held, *held, now - SUBAGENT_OPEN_WINDOW, now - 900)):
+                    t = num(s["t"]) or 0
+                    if s["parent"] is None:
+                        if s["source"] in LEASED_SOURCES and s["id"] not in opened:
+                            continue  # a closed window leaves ended_at unset until Hermes reaps it: trust the leases
+                        is_running = s["ended_at"] is None and main_is_open(s["source"], s["id"], t, opened, now)
+                    else:
+                        is_running = s["ended_at"] is None and (
+                            t > now - ACTIVE_WINDOW or (s["parent"] in opened and t > now - SUBAGENT_OPEN_WINDOW))
+                        if s["psource"] in LEASED_SOURCES and s["parent"] not in opened:
+                            is_running = False
                     extra = (_hermes_state(c, s["id"], s["act"], now) if is_running and s["parent"] is None else
                              {"state": "working" if is_running else "ended", "state_since": None, "context_tokens": None,
-                              "context_estimated": True, "loop_max": 0, "waiting_for": None})
+                              "context_estimated": True, "loop_max": 0, "waiting_for": None, "long_tool_call": None})
                     # origin: chat surfaces (desktop, cli, tui, messaging platforms) have a person at the keyboard; kanban, cron, oneshot run unattended
                     extra["origin"] = s["source"]
                     extra["interactive"] = s["source"] in INTERACTIVE_SOURCES
-                    running.append({**extra, "id": s["id"], "parent": s["parent"], "parent_title": s["ptitle"], "profile": name,
-                                    "title": s["title"],
-                                    "model": s["model"], "provider": s["prov"], "started": num(s["started_at"]),
-                                    "last": num(s["t"]), "subagent": s["parent"] is not None,
-                                    "status": "running" if is_running else (s["end_reason"] or "ended"),
-                                    # open and running vs. actually producing output right now
-                                    "working": extra["state"] == "working" if s["parent"] is None
-                                    else is_running and (num(s["t"]) or 0) > now - clis.WORKING_WINDOW,
-                                    "activity": s["act"], "tokens": s["tok"], "cost": s["cost"],
-                                    "tools": s["tools"], "messages": s["msgs"],
-                                    "parent_model": s["pmodel"], "kanban_card": None, "kanban_status": None})
+                    row = {**extra, "id": s["id"], "parent": s["parent"], "parent_title": s["ptitle"], "profile": name,
+                           "title": s["title"],
+                           "model": s["model"], "provider": s["prov"], "started": num(s["started_at"]),
+                           "last": t, "subagent": s["parent"] is not None,
+                           # status is running | ended; why it ended is end_reason (S-07)
+                           "status": "running" if is_running else "ended",
+                           "end_reason": None if is_running else (s["end_reason"] or None),
+                           # open and running vs. actually producing output right now
+                           "working": extra["state"] == "working" if s["parent"] is None
+                           else is_running and t > now - clis.WORKING_WINDOW,
+                           "activity": s["act"], "tokens": s["tok"], "cost": s["cost"],
+                           "tools": s["tools"], "messages": s["msgs"],
+                           "parent_model": s["pmodel"], "kanban_card": None, "kanban_status": None, "kanban": None,
+                           "kind": "hermes", "source_name": "Hermes"}
+                    if s["source"] == "kanban" and s["parent"] is None:
+                        # evidence for pairing the worker with its card (dropped before the response)
+                        row["_pid"] = leases.get(s["id"])
+                        fu = c.execute("""SELECT content FROM messages WHERE session_id = ? AND role = 'user'
+                                          ORDER BY id LIMIT 1""", (s["id"],)).fetchone()
+                        row["_first_user"] = (fu[0] or "")[:400] if fu else ""
+                    row["_psource"] = s["psource"]
+                    running.append(row)
         except sqlite3.Error:
             continue
 
@@ -882,14 +1215,20 @@ def live():
                    for k, v in by.items() if src is None or k == src)
 
     for s in cli_active:
+        # profile stays the CLI's display name for existing clients; `kind` / `source_name` are the unambiguous fields (S-06)
         running.append({"id": s["id"], "parent": s["parent"], "parent_title": None, "profile": clis.SOURCES[s["source"]],
-                        "source": s["source"], "title": s["title"], "model": s["model"], "provider": "",
+                        "source": s["source"], "kind": s["source"], "source_name": clis.SOURCES[s["source"]],
+                        "title": s["title"], "model": s["model"], "provider": "",
                         "started": s["started"], "last": s["last"], "subagent": s["subagent"],
-                        "status": "running" if s["running"] else "agent_close", "activity": s["project"],
+                        "status": "running" if s["running"] else "ended",
+                        "end_reason": None if s["running"] else "agent_close", "_project": s["project"],
+                        "long_tool_call": None, "kanban": None, "activity": s["project"],
                         "working": bool(s.get("working")),
                         "origin": s["source"], "interactive": True,
                         "state": s.get("state") if s["running"] else "ended", "state_since": s.get("state_since"),
-                        "waiting_for": s.get("waiting_for"), "context_tokens": s.get("context_tokens"),
+                        # enum like Hermes rows; the CLI's own reason text (e.g. "permission prompt") goes to waiting_detail
+                        "waiting_for": "approval" if s.get("state") == "needs_approval" else None,
+                        "waiting_detail": s.get("waiting_for"), "context_tokens": s.get("context_tokens"),
                         "context_estimated": s.get("context_estimated", False), "loop_max": s.get("loop_max", 0),
                         "tokens": s["total_tokens"], "cost": s["total_cost"], "tools": s["calls"], "messages": 0,
                         "parent_model": None, "kanban_card": None, "kanban_status": None})
@@ -905,12 +1244,17 @@ def live():
             burn.append({"provider": s["provider"], "window": s["window"], "used": u1,
                          "per_hour": per_hour, "eta_full": now + eta if eta else None})
 
-    kb = kanban_by_assignee()
+    # kanban: pair worker sessions with their card, then make sure EVERY running card is a row
+    cards = kanban_cards()
+    taken = match_kanban_sessions([r for r in running if r["status"] == "running"], cards)
+    for card in cards.values():
+        if card["status"] == "running" and card["id"] not in taken:
+            running.append(card_only_row(card, now))
+    by_id = {(r["profile"], r["id"]): r for r in running}
     for r in running:
-        if not r["subagent"]:
-            card = kb.get(r["profile"])
-            if card:
-                r["kanban_card"], r["kanban_status"] = card
+        r["open"] = _open_for(r, by_id)
+        for k in [k for k in r if k.startswith("_")]:
+            del r[k]
 
     running.sort(key=lambda r: -(r["last"] or 0))
     return {
@@ -924,7 +1268,7 @@ def live():
         "last_1m": window_sum(60), "last_5m": window_sum(300), "last_60m": window_sum(3600),
         "by_source_60m": {k: window_sum(3600, k) for k in providers},
         "cost_60m": window_cost(3600),
-        "running": running, "burn": burn, "quotas": quotas(),
+        "running": running, "counts": live_counts(running), "burn": burn, "quotas": quotas(),
     }
 
 

@@ -96,13 +96,21 @@ def _accounts(quota_items):
     from agent.credential_pool import _exhausted_until, load_pool
     from hermes_cli.auth import read_credential_pool
 
-    # per-account quota items ("anthropic#<label>") belong to their provider; keep their windows per credential
-    snap, per_cred = {}, {}
+    # Per-account quota items ("anthropic#<account-key>", grouped by panel._group_anthropic) belong to their
+    # provider: one item = one ACCOUNT, its `accounts` list = that account's credentials. Keep the windows per
+    # credential; a credential whose account could not be verified has no windows of its own (None = unknown).
+    snap, per_cred, cred_meta, groups = {}, {}, {}, defaultdict(list)
     for q in quota_items or []:
-        base, _, label = q["provider"].partition("#")
-        if label:
-            per_cred[(base, label)] = q.get("windows") or []
+        base, _, key = q["provider"].partition("#")
+        if key:
+            groups[base].append(key)
             snap.setdefault(base, {"provider": base, "windows": []})
+            for a in q.get("accounts") or []:
+                unverified = a.get("verification") == "unverified"
+                per_cred[(base, a["label"])] = None if unverified else (q.get("windows") or [])
+                cred_meta[(base, a["label"])] = {"account_key": a.get("account_key"),
+                                                 "verification": a.get("verification"),
+                                                 "reason": a.get("reason"), "http": a.get("http")}
         else:
             snap[base] = q
     now = time.time()
@@ -122,6 +130,7 @@ def _accounts(quota_items):
             exp = getattr(e, "expires_at_ms", None)
             creds.append({
                 "windows": per_cred.get((prov, e.label)),
+                **cred_meta.get((prov, e.label), {}),
                 "label": e.label, "source": e.source, "auth_type": e.auth_type, "priority": e.priority,
                 "status": e.last_status, "status_at": e.last_status_at,
                 "error_code": e.last_error_code, "error_reason": e.last_error_reason or getattr(e, "failure_reason", None),
@@ -130,7 +139,11 @@ def _accounts(quota_items):
                 "model_cooldowns": cooldowns,
             })
         q = snap.get(prov, {})
+        # "1 account · 2 credentials": accounts are counted only where the quota items grouped them by identity
+        n_acc = len(groups[prov]) if prov in groups else None
         out[prov] = {"provider": prov, "credentials": creds, "plan": q.get("plan"),
+                     "accounts_count": n_acc, "credentials_count": len(creds),
+                     "account_keys": groups.get(prov, []),
                      "unavailable": q.get("unavailable"), "details": q.get("details") or [],
                      "windows": q.get("windows") or [], "profiles": [], "fallback_for": []}
     return out
