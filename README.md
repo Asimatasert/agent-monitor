@@ -40,6 +40,13 @@ Hermes' own account-usage helpers, which may refresh an expiring OAuth token whi
   (Hermes' lease registry, Claude Code's process registry), however quiet it is; every running kanban card is a
   row too, paired with its worker session. A tool call that runs for minutes shows as working, not stuck.
   Every row carries an `open` action (session, kanban card, Claude Code, Copilot CLI) — see [docs/api-live.md](docs/api-live.md)
+- **Click to open** — in the web panel (Live, Özet, Kanban, sidebar) and in Agent Bar (Live tab, notch list, menu,
+  notifications, notch alerts) one click on a row does the row's `open` action: a verified URL is opened
+  (`hermes://open/<session id>` → Hermes desktop); otherwise the resume command is **copied** (never run) and a
+  toast says so (web: Shift+click copies the command instead of opening). Hermes has no per-card link, so a kanban
+  card opens the board *and* copies `hermes kanban show <id>`. Sessions waiting for approval are pinned on top in
+  orange. Agent Bar can be pointed at another server with `AGENT_MONITOR_PORT=<port>` or
+  `defaults write local.agent.bar serverPort -int <port>` (default 8777; the widget keeps 8777).
 - **Agent attention** — "finished, your turn" in the notch for the sessions you are using, notifications when an
   agent needs approval, makes no progress for 10+ minutes, repeats the same tool call or carries a very large
   context (unattended workers such as Hermes kanban jobs don't ping you)

@@ -9,7 +9,14 @@ import SwiftUI
 import UserNotifications
 import WidgetKit
 
-let BASE = "http://127.0.0.1:8777"
+/// Panel server. Default http://127.0.0.1:8777; to point the app at another instance (a test server) set
+/// AGENT_MONITOR_PORT in the environment, or `defaults write local.agent.bar serverPort -int <port>`.
+let SERVER_PORT: Int = {
+    if let p = ProcessInfo.processInfo.environment["AGENT_MONITOR_PORT"].flatMap(Int.init), p > 0 { return p }
+    let d = UserDefaults.standard.integer(forKey: "serverPort")
+    return d > 0 ? d : 8777
+}()
+let BASE = "http://127.0.0.1:\(SERVER_PORT)"
 let LAUNCHER = NSHomeDirectory() + "/agent-monitor/launch.sh"
 let LIVE_EVERY: TimeInterval = 4
 let SLOW_EVERY: TimeInterval = 60
@@ -30,13 +37,31 @@ struct LiveData: Decodable {
     let tokens: [TokMin]?
     let activity: [Act]?
     let byProfile: [ProfUse]?
+    let counts: LiveCounts?     // the server's one counting rule (open / working / needs approval / your turn / stalled)
 
     // convertFromSnakeCase turns "last_1m" into "last1M", so these are spelled out
     enum CodingKeys: String, CodingKey {
-        case now, running, burn, quotas, tokens, activity, byProfile
+        case now, running, burn, quotas, tokens, activity, byProfile, counts
         case last1m = "last1M", last5m = "last5M", last60m = "last60M", cost60m = "cost60M"
     }
 }
+
+struct LiveCounts: Decodable {
+    var open = 0, working = 0, needsApproval = 0, yourTurn = 0, stalled = 0, subagents = 0
+}
+
+/// `open` object of /api/live rows and /api/kanban cards (docs/api-live.md): what a click on the row does.
+struct OpenAction: Decodable {
+    let kind: String            // hermes-session | kanban-card | claude-code | copilot-cli | none
+    let url: String?            // set only for a scheme the server verified
+    let command: String?        // fallback: copied to the clipboard, never run
+    let label: String?
+    let cardId: String?
+    let sessionCommand: String? // kanban rows: the worker session's resume command
+    var canOpen: Bool { kind != "none" && (url != nil || command != nil) }
+}
+
+struct KanbanRef: Decodable { let id: String; let board: String?; let status: String?; let title: String?; let blockKind: String? }
 
 struct TokMin: Decodable { let t: Double; let by: [String: TC] }
 struct Act: Decodable { let t: Double; let assistant: Double?; let tool: Double?; let user: Double? }
@@ -60,7 +85,7 @@ struct Session: Decodable, Identifiable {
     let working: Bool?          // open and producing output right now (vs. open and waiting)
     let state: String?          // working | needs_approval | waiting | stalled | ended
     let stateSince: Double?
-    let waitingFor: String?     // Claude Code: why it needs you (e.g. "permission prompt")
+    let waitingFor: String?     // approval | input | review | nil
     let contextTokens: Double?
     let contextEstimated: Bool?
     let loopMax: Int?
@@ -70,17 +95,33 @@ struct Session: Decodable, Identifiable {
     let parentModel: String?    // its model — shown on a subagent row as "← from <model>"
     let kanbanCard: String?     // the card this agent is on (assignee==profile match; main sessions only)
     let kanbanStatus: String?   // that card's column: running | blocked | ready | todo | triage
+    let kind: String?           // hermes | claude-code | copilot-cli
+    let origin: String?         // desktop | cli | tui | kanban | telegram | claude-code …
+    let endReason: String?
+    let waitingDetail: String?  // Claude Code: the CLI's own reason text ("permission prompt")
+    let longToolCall: String?   // a tool call that has been running for a while (not "stuck")
+    let cardOnly: Bool?         // a running kanban card without a session row
+    let kanban: KanbanRef?      // the paired card (kanban worker rows only)
+    let open: OpenAction?
     var isRunning: Bool { status == "running" }
     var isWorking: Bool { isRunning && working == true }
-    // grouping key/name for the account a session runs under
-    var accountKey: String { source == "claude-code" ? "claude-code" : source == "copilot-cli" ? "copilot-cli" : "hermes/\(profile ?? "?")" }
-    var accountName: String { source == "claude-code" ? "Claude Code" : source == "copilot-cli" ? "Copilot CLI" : "Hermes · \(profile ?? "?")" }
+    // grouping key/name: who runs the session (Hermes profile / Claude Code / Copilot CLI) — not a provider account
+    var groupKey: String { source == "claude-code" ? "claude-code" : source == "copilot-cli" ? "copilot-cli" : "hermes/\(profile ?? "?")" }
+    var groupName: String { source == "claude-code" ? "Claude Code" : source == "copilot-cli" ? "Copilot CLI" : "Hermes · \(profile ?? "?")" }
 }
 
 struct Burn: Decodable { let provider: String; let window: String; let perHour: Double; let etaFull: Double? }
 struct Quotas: Decodable { let items: [QuotaItem]? }
-struct QuotaItem: Decodable { let provider: String; let accounts: [Account]?; let windows: [QuotaWindow]? }
-struct Account: Decodable { let label: String?; let status: String?; let requests: Double? }
+struct QuotaItem: Decodable {
+    let provider: String; let accounts: [Account]?; let windows: [QuotaWindow]?
+    let accountKey: String?     // set when the account identity was read (one item per real account)
+}
+/// One credential in Hermes' pool (several credentials can belong to one account).
+struct Account: Decodable {
+    let label: String?; let status: String?; let requests: Double?
+    let source: String?; let verification: String?; let reason: String?; let http: Double?
+    var unverified: Bool { verification == "unverified" }
+}
 struct QuotaWindow: Decodable { let label: String; let used: Double?; let reset: Double?; let detail: String? }
 
 struct AccountsResp: Decodable { let history: [QHist] }
@@ -93,7 +134,7 @@ struct ModelUse: Decodable { let model: String?; let provider: String?; let toke
 struct CliSummary: Decodable { let sources: [CliSrc]; let daily: [CliDay] }
 struct CliSrc: Decodable { let source: String; let name: String; let tokens: Double?; let cost: Double?; let sessions: Double? }
 struct CliDay: Decodable { let day: String; let tokens: [String: Double]; let cost: [String: Double] }
-struct Board: Decodable { let board: String; let counts: [String: Double]; let cards: [Card] }
+struct Board: Decodable { let board: String; let counts: [String: Double]; let cards: [Card]; let blockedByKind: [String: Double]? }
 struct Card: Decodable, Identifiable {
     let id: String
     let title: String?
@@ -103,6 +144,9 @@ struct Card: Decodable, Identifiable {
     let completedAt: Double?
     let consecutiveFailures: Double?
     let lastFailureError: String?
+    let blockKind: String?      // needs_input = waiting for a human answer
+    let waitingFor: String?     // input | review | nil
+    let open: OpenAction?
 }
 
 // /api/health — decoded without key conversion ("calls_24h" would become "calls24H"), so snake_case names.
@@ -126,15 +170,26 @@ struct Speed: Decodable, Identifiable {
 let LARGE_CONTEXT = 200_000.0  // past this, a session re-sends a lot every turn: slower and pricier
 let HOVER_SESSION_CAP = 6      // above this many sessions the notch hover list shows its scroll indicator
 
-/// Short state label for a session ("waiting for you · 3m").
+/// Short state label for a session ("your turn · 3m"). Same words on every surface.
 func stateText(_ s: Session, now: Double) -> String? {
     let since = s.stateSince.map { " · " + span(now - $0) } ?? ""
     switch s.state {
-    case "needs_approval": return L("needs approval", "onay bekliyor") + (s.waitingFor.map { " (\($0))" } ?? "") + since
-    case "waiting": return L("waiting for you", "seni bekliyor") + since
+    case "needs_approval": return L("needs approval", "onay bekliyor") + (s.waitingDetail.map { " (\($0))" } ?? "") + since
+    case "waiting": return L("your turn", "sıra sende") + since
     case "stalled": return L("stalled?", "takıldı mı?") + since
-    default: return nil
+    default:
+        // a tool call that is still running is work, not a stall
+        return s.longToolCall.map { L("long tool call: \($0)", "uzun araç çağrısı: \($0)") }
     }
+}
+
+/// "3 working · 1 needs approval · 2 your turn" — one wording for the bar, the notch and the Live tab.
+func countLine(_ c: LiveCounts) -> String {
+    var p = [L("\(c.working) working", "\(c.working) çalışıyor")]
+    if c.needsApproval > 0 { p.append(L("\(c.needsApproval) needs approval", "\(c.needsApproval) onay bekliyor")) }
+    if c.yourTurn > 0 { p.append(L("\(c.yourTurn) your turn", "\(c.yourTurn) sıra sende")) }
+    if c.stalled > 0 { p.append(L("\(c.stalled) stalled?", "\(c.stalled) takıldı mı?")) }
+    return p.joined(separator: " · ")
 }
 struct Chain: Decodable, Identifiable {
     let profile: String
@@ -187,8 +242,12 @@ struct HAccount: Decodable {
     let profiles: [String]
     let fallback_for: [String]
     let windows: [QuotaWindow]
+    let accounts_count: Int?    // accounts behind the credentials (nil = identity not readable for this provider)
+    let credentials_count: Int?
 }
 struct Cred: Decodable {
+    let account_key: String?
+    let verification: String?
     let label: String?
     let source: String?
     let auth_type: String?
@@ -251,11 +310,21 @@ let WINDOW_NAME: [String: (String, String)] = [
 ]
 /// "anthropic#work" = one of several accounts of a provider: shown as "Anthropic (Claude) · work".
 func pBase(_ p: String) -> String { String(p.split(separator: "#", maxSplits: 1).first ?? Substring(p)) }
+/// Providers that currently have >= 2 account items (set by the store); only these get the "· <account>" suffix.
+var multiAccountBases: Set<String> = []
 func pName(_ p: String) -> String {
     let parts = p.split(separator: "#", maxSplits: 1).map(String.init)
     let base = parts[0] == "bilinmiyor" ? L("Unknown", "Bilinmiyor") : (PROVIDER_NAME[parts[0]] ?? parts[0])
-    return parts.count > 1 ? "\(base) · \(parts[1])" : base
+    return parts.count > 1 && multiAccountBases.contains(parts[0]) ? "\(base) · \(parts[1])" : base
 }
+func credKind(_ source: String?) -> String {
+    guard let s = source else { return "" }
+    if s.hasPrefix("env:") { return L("env variable", "ortam değişkeni") }
+    if s == "claude_code" { return L("Claude Code login", "Claude Code girişi") }
+    if s == "gh_cli" { return "GitHub CLI" }
+    return s
+}
+func plural(_ n: Int, _ one: String, _ many: String, tr: String) -> String { isTR() ? "\(n) \(tr)" : "\(n) \(n == 1 ? one : many)" }
 func wName(_ w: String) -> String { WINDOW_NAME[w].map { L($0.0, $0.1) } ?? w }
 
 /// Legend scale limited to the sources actually present (so absent CLIs don't clutter the legend).
@@ -264,10 +333,11 @@ func sourceScale(_ present: Set<String>) -> (domain: [String], range: [Color]) {
     return (keys, keys.map { SOURCE_COLOR[$0]! })
 }
 
-let KANBAN_ORDER = ["running", "blocked", "ready", "todo", "triage", "done"]
+let KANBAN_ORDER = ["running", "review", "blocked", "ready", "scheduled", "todo", "triage", "done"]
 let KANBAN_NAME: [String: (String, String)] = [
-    "running": ("Running", "Çalışan"), "blocked": ("Blocked", "Bloklu"), "ready": ("Ready", "Hazır"),
-    "todo": ("To do", "Yapılacak"), "triage": ("Triage", "Triaj"), "done": ("Done", "Biten"), "archived": ("Archived", "Arşiv"),
+    "running": ("Running", "Çalışıyor"), "blocked": ("Blocked", "Bloklu"), "ready": ("Ready", "Hazır"),
+    "todo": ("To do", "Yapılacak"), "triage": ("Triage", "Triaj"), "done": ("Done", "Bitti"), "archived": ("Archived", "Arşiv"),
+    "review": ("In review", "İncelemede"), "scheduled": ("Scheduled", "Zamanlandı"),
 ]
 func kName(_ k: String) -> String? { KANBAN_NAME[k].map { L($0.0, $0.1) } }
 
@@ -303,6 +373,7 @@ func kanbanColor(_ status: String?) -> Color {
     switch status {
     case "running": return .green
     case "blocked": return .red
+    case "review": return .purple
     case "ready": return .cyan
     case "todo", "triage": return .orange
     default: return .secondary
@@ -363,6 +434,9 @@ func openPanel() {
     let p = Process()
     p.executableURL = URL(fileURLWithPath: "/bin/sh")
     p.arguments = [LAUNCHER]
+    var env = ProcessInfo.processInfo.environment
+    env["AGENT_MONITOR_PORT"] = String(SERVER_PORT)
+    p.environment = env
     try? p.run()
 }
 
@@ -684,6 +758,94 @@ final class BarAnimator: ObservableObject {
     }
 }
 
+// ---------- opening things (one rule for every row, notification and island event) ----------
+
+let OPEN_SCHEMES: Set<String> = ["hermes", "http", "https"]
+
+extension OpenAction {
+    /// Notification payload (property-list types only).
+    var userInfo: [String: String] {
+        ["kind": kind, "url": url ?? "", "command": command ?? "", "label": label ?? "", "cardId": cardId ?? "", "sessionCommand": sessionCommand ?? ""]
+    }
+    init?(userInfo i: [AnyHashable: Any]) {
+        guard let kind = i["kind"] as? String, !kind.isEmpty else { return nil }
+        func opt(_ k: String) -> String? { (i[k] as? String).flatMap { $0.isEmpty ? nil : $0 } }
+        self.init(kind: kind, url: opt("url"), command: opt("command"), label: opt("label"), cardId: opt("cardId"), sessionCommand: opt("sessionCommand"))
+    }
+}
+
+@MainActor
+enum Opener {
+    enum Source { case row, notification }
+
+    /// url -> NSWorkspace.open; no url (or nothing handles it) -> copy the command and tell the user.
+    /// A command is never run for the user: it may hold a project path / id from the data, and running shell text
+    /// without a click on "Run" is the wrong default (it also would need Automation permission for Terminal).
+    /// Kanban cards: Hermes has no per-card route, so the board opens AND the card command is copied.
+    static func open(_ a: OpenAction?, source: Source = .row) {
+        guard let a, a.canOpen else { say(L("Nothing to open for this row", "Bu satır için açılacak bir yer yok"), source); return }
+        let url = a.url.flatMap(URL.init(string:)).flatMap { OPEN_SCHEMES.contains($0.scheme?.lowercased() ?? "") ? $0 : nil }
+        let handled = url.map { NSWorkspace.shared.urlForApplication(toOpen: $0) != nil } ?? false
+        let name = a.label ?? a.cardId ?? ""
+        if a.kind == "kanban-card" {
+            let copied = a.command.map(copy) ?? false
+            if handled, let url {
+                NSWorkspace.shared.open(url)
+                say(L("No per-card link in Hermes: board opened", "Karta özel bağlantı yok: Hermes panosu açıldı")
+                    + (copied ? L(", card command copied: \(a.command ?? "")", ", kart komutu kopyalandı: \(a.command ?? "")") : ""), source)
+            } else if copied, let c = a.command {
+                say(L("Command copied — run it in Terminal: \(c)", "Komut kopyalandı — Terminal'de çalıştır: \(c)"), source)
+            }
+            return
+        }
+        if handled, let url {
+            NSWorkspace.shared.open(url)
+            say(L("Opening: \(name)", "Açılıyor: \(name)"), source)
+        } else if let c = a.command {
+            copy(c)
+            say(L("Command copied — run it in Terminal: \(c)", "Komut kopyalandı — Terminal'de çalıştır: \(c)"), source)
+        }
+    }
+
+    @discardableResult
+    static func copy(_ text: String) -> Bool {
+        NSPasteboard.general.clearContents()
+        return NSPasteboard.general.setString(text, forType: .string)
+    }
+
+    /// Visible feedback: a toast in the open panel / notch list; a banner when the click came from a notification
+    /// (nothing else is on screen then).
+    private static func say(_ text: String, _ source: Source) {
+        Store.main.showToast(text)
+        if source == .notification { Notifier.local(L("Agent Monitor", "Agent Monitor"), text) }
+    }
+}
+
+/// Click opens the row's `open` action; rows without one stay inert (no pointer, no button trait).
+struct OpenableModifier: ViewModifier {
+    let action: OpenAction?
+    func body(content: Content) -> some View {
+        if let a = action, a.canOpen {
+            content
+                .contentShape(Rectangle())
+                .onTapGesture { Opener.open(a) }
+                .modifier(LinkCursor())
+                .accessibilityAddTraits(.isButton)
+                .accessibilityHint(a.url != nil ? L("Opens it", "Açar") : L("Copies the command", "Komutu kopyalar"))
+        } else {
+            content
+        }
+    }
+}
+struct LinkCursor: ViewModifier {
+    func body(content: Content) -> some View {
+        if #available(macOS 15, *) { content.pointerStyle(.link) } else { content }
+    }
+}
+extension View {
+    func openable(_ a: OpenAction?) -> some View { modifier(OpenableModifier(action: a)) }
+}
+
 // ---------- settings ----------
 
 enum Pref {
@@ -781,13 +943,30 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         done([.banner, .sound])
     }
 
-    private func post(_ title: String, _ body: String) {
+    /// A click on a notification opens what it is about (the session / card), via the same `open` rule as a row click.
+    nonisolated func userNotificationCenter(_ center: UNUserNotificationCenter, didReceive response: UNNotificationResponse,
+                                            withCompletionHandler done: @escaping () -> Void) {
+        let action = OpenAction(userInfo: response.notification.request.content.userInfo)
+        Task { @MainActor in Opener.open(action, source: .notification) }
+        done()
+    }
+
+    /// Plain banner without an open target (feedback such as "command copied").
+    nonisolated static func local(_ title: String, _ body: String) {
+        let c = UNMutableNotificationContent()
+        c.title = title
+        c.body = body
+        UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
+    }
+
+    private func post(_ title: String, _ body: String, open: OpenAction? = nil) {
         let c = UNMutableNotificationContent()
         c.title = title
         c.body = body
         c.sound = .default
+        if let open, open.canOpen { c.userInfo = open.userInfo }
         UNUserNotificationCenter.current().add(UNNotificationRequest(identifier: UUID().uuidString, content: c, trigger: nil))
-        Island.shared.push(IslandEvent(provider: nil, symbol: "bell.badge.fill", title: title, detail: body, tint: .orange, gauge: nil))
+        Island.shared.push(IslandEvent(provider: nil, symbol: "bell.badge.fill", title: title, detail: body, tint: .orange, gauge: nil, open: open))
     }
 
     /// Once per quota window period and threshold (80 %, 95 %); remembered across restarts.
@@ -816,16 +995,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         for b in boards {
             for c in b.cards {
                 let fails = Int(c.consecutiveFailures ?? 0)
-                let key: String? = c.status == "blocked" ? "\(c.id)|blocked" : fails > 0 ? "\(c.id)|fail\(fails)" : nil
+                let needsInput = c.status == "blocked" && c.blockKind == "needs_input"
+                let key: String? = needsInput ? "\(c.id)|input" : c.status == "blocked" ? "\(c.id)|blocked" : c.status == "review" ? "\(c.id)|review" : fails > 0 ? "\(c.id)|fail\(fails)" : nil
                 guard let key else { continue }
                 now.insert(key)
-                if let seen = cardsSeen, !seen.contains(key) { fresh.append((b, c, c.status == "blocked" ? L("blocked", "bloklandı") : L("failing", "hata verdi"))) }
+                let what = needsInput ? L("needs your input", "girdi bekliyor") : c.status == "blocked" ? L("blocked", "bloklandı")
+                    : c.status == "review" ? L("is waiting for review", "inceleme bekliyor") : L("failing", "hata verdi")
+                if let seen = cardsSeen, !seen.contains(key) { fresh.append((b, c, what)) }
             }
         }
         cardsSeen = now
         guard Pref.on(Pref.notifyKanban) else { return }
         for (b, c, what) in fresh.prefix(5) {
-            post(L("Kanban: card \(what)", "Kanban: kart \(what)"), "\(c.title ?? c.id)\n\(b.board) · \(c.assignee ?? L("unassigned", "atanmamış"))")
+            post(L("Kanban: card \(what)", "Kanban: kart \(what)"), "\(c.title ?? c.id)\n\(b.board) · \(c.assignee ?? L("unassigned", "atanmamış"))", open: c.open)
         }
     }
 
@@ -939,19 +1121,19 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
         }
         for s in mains {
             let title = s.title ?? L("(untitled)", "(başlıksız)")
-            let who = s.source == "claude-code" ? "Claude Code" : s.source == "copilot-cli" ? "Copilot CLI" : "Hermes · \(s.profile ?? "")"
+            let who = s.groupName
             let before = agentState[s.id]
             if before != s.state {
                 switch s.state {
                 case "waiting" where before == "working" && s.attended:
                     Island.shared.push(IslandEvent(provider: nil, symbol: "checkmark.circle.fill",
                                                    title: L("\(who) finished — your turn", "\(who) bitirdi — sıra sende"),
-                                                   detail: title, tint: .green, gauge: nil))
+                                                   detail: title, tint: .green, gauge: nil, open: s.open))
                 case "needs_approval":
-                    post(L("\(who) needs approval", "\(who) onay bekliyor"), title + (s.waitingFor.map { " — \($0)" } ?? ""))
+                    post(L("\(who) needs approval", "\(who) onay bekliyor"), title + (s.waitingDetail.map { " — \($0)" } ?? ""), open: s.open)
                 case "stalled":
                     post(L("\(who) may be stuck", "\(who) takılmış olabilir"),
-                         title + L(" — no progress for 10+ min", " — 10+ dakikadır ilerleme yok"))
+                         title + L(" — no progress for 30 min", " — 30 dakikadır ilerleme yok"), open: s.open)
                 default: break
                 }
             }
@@ -977,7 +1159,11 @@ final class Notifier: NSObject, UNUserNotificationCenterDelegate {
     }
 
     func sessions(_ running: [Session]) {
-        let mains = Dictionary(running.filter { $0.isRunning && !$0.subagent }.map { ($0.id, $0.title ?? L("(untitled)", "(başlıksız)")) },
+        // Sources listed while their lease / process is alive: when one disappears it really closed. The others
+        // (telegram, slack, cron… and card-only rows) also drop out after 10 quiet minutes, which is not "ended".
+        let leased: Set<String> = ["desktop", "cli", "tui", "kanban", "claude-code"]
+        let mains = Dictionary(running.filter { $0.isRunning && !$0.subagent && $0.cardOnly != true && leased.contains($0.origin ?? "") }
+                                .map { ($0.id, $0.title ?? L("(untitled)", "(başlıksız)")) },
                                uniquingKeysWith: { a, _ in a })
         if let prev = mainsSeen, Pref.on(Pref.notifySessions) {
             for (id, title) in prev where mains[id] == nil { post(L("Session ended", "Oturum bitti"), title) }
@@ -1000,8 +1186,21 @@ final class Store: ObservableObject {
     @Published var topWeek: [TopSession] = []
     @Published var offline = false
     @Published var updated: Date?
+    @Published var toast: String?
+    private var toastToken = 0
     private let notifier = Notifier()
     let anim = BarAnimator()
+
+    /// A short message shown at the bottom of the panel / notch list (click feedback).
+    func showToast(_ text: String) {
+        toast = text
+        toastToken += 1
+        let token = toastToken
+        DispatchQueue.main.asyncAfter(deadline: .now() + 5) { [weak self] in
+            guard let self, self.toastToken == token else { return }
+            withAnimation { self.toast = nil }
+        }
+    }
 
     private var lastMainCount: Int?
     private var lastWorkingCount: Int?
@@ -1066,6 +1265,9 @@ final class Store: ObservableObject {
             defer { liveBusy = false }
             do {
                 let d = try await Store.get("/api/live", as: LiveData.self)
+                var perBase: [String: Int] = [:]
+                for it in d.quotas?.items ?? [] { perBase[pBase(it.provider), default: 0] += 1 }
+                multiAccountBases = Set(perBase.filter { $0.value > 1 }.keys)
                 live = d
                 let n = mains.count, w = workingMains.count
                 let wa = workingMains.filter(\.attended).count
@@ -1089,7 +1291,8 @@ final class Store: ObservableObject {
             } catch {
                 offline = true
                 // the bar is useless without the panel server: bring it up, at most once a minute
-                if Pref.on(Pref.autoStart), lastStart.map({ Date().timeIntervalSince($0) > 60 }) ?? true {
+                // (only for the default port: a test instance is started by whoever points the app at it)
+                if Pref.on(Pref.autoStart), SERVER_PORT == 8777, lastStart.map({ Date().timeIntervalSince($0) > 60 }) ?? true {
                     lastStart = Date()
                     startServer()
                 }
@@ -1160,6 +1363,18 @@ final class Store: ObservableObject {
         return mains.filter { $0.isWorking || busyParents.contains($0.id) }
     }
     var subs: [Session] { (live?.running ?? []).filter { $0.subagent } }
+    /// One counting rule for every surface (server `counts`; computed here only for an older server).
+    var counts: LiveCounts {
+        if let c = live?.counts { return c }
+        let m = mains
+        return LiveCounts(open: m.count, working: workingMains.count, needsApproval: m.filter { $0.state == "needs_approval" }.count,
+                          yourTurn: m.filter { $0.state == "waiting" }.count, stalled: m.filter { $0.state == "stalled" }.count,
+                          subagents: subs.filter(\.isRunning).count)
+    }
+    /// Sessions waiting for an approval, longest first — pinned at the top of every list.
+    var approvals: [Session] {
+        mains.filter { $0.state == "needs_approval" }.sorted { ($0.stateSince ?? .infinity) < ($1.stateSince ?? .infinity) }
+    }
 
     /// Total tokens per minute for the last 30 minutes (bar sparkline).
     var spark: [Double] {
@@ -1214,7 +1429,7 @@ final class Store: ObservableObject {
         var out: [BarPiece] = []
         if count {
             out.append(BarPiece(icon: NSImage(systemSymbolName: mains.isEmpty ? "bolt.horizontal.circle" : "bolt.horizontal.circle.fill",
-                                              accessibilityDescription: nil), text: "\(mains.count)"))
+                                              accessibilityDescription: nil), text: "\(counts.open)"))
         }
         if tokens {
             out.append(BarPiece(icon: NSImage(systemSymbolName: "waveform", accessibilityDescription: nil),
@@ -1340,27 +1555,28 @@ struct LiveTab: View {
         if let d = store.live {
             VStack(alignment: .leading, spacing: 10) {
                 LazyVGrid(columns: Array(repeating: GridItem(.flexible(), spacing: 8), count: 3), spacing: 8) {
-                    Kpi(title: L("Running sessions", "Çalışan oturum"), value: "\(store.mains.count)")
-                    Kpi(title: L("Running subagents", "Çalışan alt ajan"), value: "\(store.subs.filter(\.isRunning).count)")
-                    Kpi(title: L("Cost, 60 min", "60 dk maliyet"), value: money(d.cost60m))
+                    Kpi(title: L("Open sessions", "Açık oturum"), value: "\(store.counts.open)", note: countLine(store.counts))
+                    Kpi(title: L("Subagents", "Alt ajan"), value: "\(store.counts.subagents)", note: L("working", "çalışan"))
+                    Kpi(title: L("API-equivalent, 60 min", "60 dk API karşılığı"), value: money(d.cost60m), note: L("estimate", "tahmini"))
                     Kpi(title: L("Last 1 min", "Son 1 dk"), value: compact(d.last1m), note: L("tokens", "token"))
                     Kpi(title: L("Last 5 min", "Son 5 dk"), value: compact(d.last5m), note: L("tokens", "token"))
                     Kpi(title: L("Last 60 min", "Son 60 dk"), value: compact(d.last60m), note: L("tokens", "token"))
                 }
+                if !store.approvals.isEmpty { ApprovalBanner(items: store.approvals, now: d.now) }
                 SectionTitle(text: L("Tokens / minute", "Token / dakika"), trailing: L("last 60 min", "son 60 dk"))
                 TokenChart(points: tokenPoints(d))
-                SectionTitle(text: L("Messages / minute", "Mesaj / dakika"), trailing: "Hermes")
+                SectionTitle(text: L("Messages / minute", "Mesaj / dakika"), trailing: L("Hermes only", "yalnızca Hermes"))
                 if (d.activity ?? []).contains(where: { ($0.assistant ?? 0) + ($0.tool ?? 0) + ($0.user ?? 0) > 0 }) {
                     ActivityChart(acts: d.activity ?? [])
                 } else {
                     Text(L("No Hermes messages in the last hour", "Son bir saatte Hermes mesajı yok"))
                         .font(.caption).foregroundStyle(.secondary)
                 }
-                SectionTitle(text: L("Running sessions", "Çalışan oturumlar"), trailing: L("incl. subagents finished in the last 15 min", "son 15 dk'da biten alt ajanlar dahil"))
+                SectionTitle(text: L("Open sessions", "Açık oturumlar"), trailing: L("click a row to open it · incl. subagents finished in the last 15 min", "satıra tıkla: aç · son 15 dk'da biten alt ajanlar dahil"))
                 if store.mains.isEmpty {
-                    Text(L("No sessions running right now", "Şu an çalışan oturum yok")).font(.callout).foregroundStyle(.secondary)
+                    Text(L("No open sessions right now", "Şu an açık oturum yok")).font(.callout).foregroundStyle(.secondary)
                 } else {
-                    AccountGroups(mains: store.mains, subs: store.subs, now: d.now)
+                    SessionGroups(mains: store.mains, subs: store.subs, now: d.now)
                 }
                 if let speed = store.health?.speed, !speed.isEmpty {
                     SectionTitle(text: L("Model speed", "Model hızı"), trailing: L("median / p90 turn · 24 h", "tur medyanı / p90 · 24 sa"))
@@ -1416,6 +1632,35 @@ struct ActivityChart: View {
     }
 }
 
+/// Sessions waiting for approval, pinned above the lists: orange, one click opens the session.
+struct ApprovalBanner: View {
+    let items: [Session]
+    let now: Double
+    var dense = false
+    var body: some View {
+        VStack(alignment: .leading, spacing: dense ? 3 : 5) {
+            Label(L("\(items.count) waiting for your approval", "\(items.count) iş onay bekliyor"), systemImage: "hand.raised.fill")
+                .font((dense ? Font.caption : .callout).weight(.semibold)).foregroundStyle(.orange)
+            ForEach(items) { s in
+                HStack(spacing: 6) {
+                    Text(s.title ?? L("(untitled)", "(başlıksız)")).lineLimit(1).truncationMode(.tail)
+                    Spacer(minLength: 4)
+                    Text(s.groupName + (s.stateSince.map { " · " + span(now - $0) } ?? "")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    if let o = s.open, o.canOpen { Image(systemName: o.url != nil ? "arrow.up.forward.square" : "doc.on.doc").font(.caption2).foregroundStyle(.orange) }
+                }
+                .font(dense ? .caption : .callout)
+                .padding(.vertical, 3).padding(.horizontal, 6)
+                .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
+                .openable(s.open)
+                .help([s.title, s.open.flatMap { $0.canOpen ? ($0.url != nil ? L("Click to open the session", "Tıkla: oturumu aç") : L("Click to copy the resume command", "Tıkla: devam komutunu kopyala")) : nil }].compactMap { $0 }.joined(separator: "\n"))
+            }
+        }
+        .padding(8)
+        .background(Color.orange.opacity(0.10), in: RoundedRectangle(cornerRadius: 10))
+        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.orange.opacity(0.6), lineWidth: 1))
+    }
+}
+
 struct SessionTree: View {
     let mains: [Session]
     let subs: [Session]
@@ -1441,9 +1686,9 @@ struct SessionTree: View {
     }
 }
 
-/// Running sessions grouped by the account they run under (Hermes · <profile> / Claude Code / Copilot CLI),
+/// Open sessions grouped by who runs them (Hermes · <profile> / Claude Code / Copilot CLI — NOT a provider account),
 /// each group headed by its session count, tokens and total cost. Subagents nest under their main session.
-struct AccountGroups: View {
+struct SessionGroups: View {
     let mains: [Session]
     let subs: [Session]
     let now: Double
@@ -1452,10 +1697,10 @@ struct AccountGroups: View {
         var order: [String] = []
         var byKey: [String: [Session]] = [:]
         for s in mains {
-            if byKey[s.accountKey] == nil { order.append(s.accountKey) }
-            byKey[s.accountKey, default: []].append(s)
+            if byKey[s.groupKey] == nil { order.append(s.groupKey) }
+            byKey[s.groupKey, default: []].append(s)
         }
-        return order.map { (key: $0, name: byKey[$0]!.first!.accountName, items: byKey[$0]!) }
+        return order.map { (key: $0, name: byKey[$0]!.first!.groupName, items: byKey[$0]!) }
     }
     var body: some View {
         VStack(alignment: .leading, spacing: dense ? 9 : 12) {
@@ -1494,25 +1739,28 @@ struct SessionRow: View {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
                     Text(s.title ?? L("(untitled)", "(başlıksız)")).lineLimit(1).truncationMode(.tail)
-                    // which kanban column this agent's card is in (main sessions only; assignee==profile)
-                    if let ks = s.kanbanStatus, let name = kName(ks) {
-                        Text(name).font(.system(size: 9, weight: .semibold))
+                    // kanban worker rows only: the card it works on (server pairs by worker pid / task id, not by profile)
+                    if let k = s.kanban, let ks = k.status {
+                        Text((kName(ks) ?? ks) + " · " + k.id).font(.system(size: 9, weight: .semibold))
                             .padding(.horizontal, 5).padding(.vertical, 1)
                             .background(Capsule().fill(kanbanColor(ks).opacity(0.22)))
                             .foregroundStyle(kanbanColor(ks))
                             .fixedSize()
                     }
+                    if s.cardOnly == true {
+                        Text(L("no session found", "oturum bulunamadı")).font(.system(size: 9)).foregroundStyle(.secondary).fixedSize()
+                    }
                 }
-                // a subagent carries the model it was spawned from: "↳ from Opus"
-                if s.subagent, let origin = modelShort(s.parentModel) ?? s.parentTitle {
-                    Text(L("↳ from \(origin)", "↳ \(origin) işinden")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                // a subagent names the session it was spawned from; the model comes on the next line
+                if s.subagent, let parent = s.parentTitle ?? modelShort(s.parentModel) {
+                    Text(L("↳ subagent of “\(parent)”", "↳ “\(parent)” oturumunun alt ajanı")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Text([modelShort(s.model), runningSubs > 0 ? L("\(runningSubs) subagents", "\(runningSubs) alt ajan") : nil,
+                Text([modelShort(s.model), runningSubs > 0 ? (runningSubs == 1 ? L("1 subagent", "1 alt ajan") : L("\(runningSubs) subagents", "\(runningSubs) alt ajan")) : nil,
                       s.isRunning ? idle : L("ended", "bitti")].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 if s.isRunning, let st = stateText(s, now: now) {
-                    Text(st).font(.caption2.weight(.medium))
-                        .foregroundStyle(s.state == "waiting" ? Color.green : .orange)
+                    Text(st).font(.caption2.weight(s.state == "needs_approval" ? .bold : .medium))
+                        .foregroundStyle(s.state == "waiting" ? Color.green : s.state == "needs_approval" ? .orange : (s.state == nil || s.state == "working") ? Color.secondary : .orange)
                 }
                 if let a = s.activity, !a.isEmpty {
                     Text(a).font(.caption2).foregroundStyle(.tertiary).lineLimit(1).truncationMode(.middle)
@@ -1536,8 +1784,14 @@ struct SessionRow: View {
             }
         }
         .font(.callout)
-        .help([s.title, s.kanbanCard.map { L("card: ", "kart: ") + $0 }, s.activity].compactMap { $0 }.joined(separator: "\n"))
-        .contextMenu { SessionActions(id: s.id, source: s.source) }
+        .padding(.horizontal, s.state == "needs_approval" && s.isRunning ? 6 : 0)
+        .padding(.vertical, s.state == "needs_approval" && s.isRunning ? 3 : 0)
+        .background(s.state == "needs_approval" && s.isRunning ? Color.orange.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 6))
+        .openable(s.open)
+        .help([s.title, s.kanban?.title.map { L("card: ", "kart: ") + $0 },
+               s.open.flatMap { $0.canOpen ? ($0.url != nil && $0.kind != "kanban-card" ? L("Click to open", "Tıkla: aç") : L("Click: opens the board / copies the command", "Tıkla: panoyu açar / komutu kopyalar")) : nil },
+               s.activity].compactMap { $0 }.joined(separator: "\n"))
+        .contextMenu { SessionActions(id: s.id, source: s.source, profile: s.profile, open: s.open) }
     }
 
     /// "son hareket 3 dk önce" once a running session has been quiet for more than a minute.
@@ -1603,7 +1857,7 @@ struct OtherAccounts: View {
     let items: [QuotaItem]
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
-            SectionTitle(text: L("Other accounts", "Diğer hesaplar"), trailing: L("details: Health tab", "ayrıntı: Sağlık sekmesi"))
+            SectionTitle(text: L("Other providers", "Diğer sağlayıcılar"), trailing: L("details: Health tab", "ayrıntı: Sağlık sekmesi"))
             ForEach(items, id: \.provider) { item in
                 HStack(alignment: .firstTextBaseline) {
                     Text(pName(item.provider)).font(.callout)
@@ -1649,10 +1903,10 @@ struct QuotaCard: View {
                 .help(collapsed ? L("Expand", "Genişlet")
                       : L("Collapse — reopens by itself on every 2% step or when burning fast", "Daralt — yüzde %2 değişince ya da hızlı tüketimde kendiliğinden açılır"))
                 Spacer()
-                ForEach(Array((item.accounts ?? []).enumerated()), id: \.offset) { _, a in
-                    let st = accountStatus(a.status)
-                    Chip(text: "\(a.label ?? L("account", "hesap")) · \(st.0)", color: st.1)
-                }
+                // a credential is not an account: one account can hold several credentials
+                let creds = item.accounts ?? []
+                Chip(text: (item.accountKey != nil ? L("1 account · ", "1 hesap · ") : "") + plural(creds.count, "credential", "credentials", tr: "kimlik bilgisi"),
+                     color: creds.contains(where: \.unverified) ? .orange : .secondary)
             }
             let windows = (item.windows ?? []).filter { $0.used != nil }
             if collapsed {
@@ -1675,6 +1929,20 @@ struct QuotaCard: View {
                 .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisGridLine(); AxisValueLabel(format: .dateTime.hour().minute()) } }
                 .chartLegend(position: .bottom, alignment: .leading)
                 .frame(height: 110)
+            }
+            ForEach(Array((item.accounts ?? []).enumerated()), id: \.offset) { _, a in
+                let st = accountStatus(a.status)
+                HStack(spacing: 6) {
+                    Text(a.label ?? L("credential", "kimlik bilgisi")).font(.caption.weight(.medium))
+                    Text(credKind(a.source)).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
+                    Spacer()
+                    if a.unverified {
+                        Chip(text: L("account unverified", "hesabı doğrulanamadı"), color: .orange)
+                            .help(L("Which account this credential belongs to could not be read\(a.http.map { " (HTTP \(Int($0)))" } ?? ""); it is not counted as a separate account.",
+                                    "Bu kimlik bilgisinin hangi hesaba ait olduğu okunamadı\(a.http.map { " (HTTP \(Int($0)))" } ?? ""); ayrı hesap sayılmadı."))
+                    }
+                    Chip(text: st.0, color: st.1)
+                }
             }
             }
         }
@@ -1779,7 +2047,7 @@ struct UsageTab: View {
             VStack(alignment: .leading, spacing: 10) {
                 BudgetCard(store: store)
                 Picker("", selection: $metric) {
-                    Text(L("Cost", "Maliyet")).tag("cost")
+                    Text(L("API cost", "API karşılığı")).tag("cost")
                     Text(L("Tokens", "Token")).tag("tokens")
                 }
                 .pickerStyle(.segmented).labelsHidden()
@@ -1927,7 +2195,7 @@ struct TopSessionsView: View {
                 MeterRow(name: r.title ?? L("(untitled)", "(başlıksız)"), value: r.cost, top: top,
                          label: "\(money(r.cost)) · \(compact(r.tokens))")
                     .help("\(r.profile) · \(r.model ?? "")" + L(" — session total", " — oturum toplamı"))
-                    .contextMenu { SessionActions(id: r.id, source: r.source) }
+                    .contextMenu { SessionActions(id: r.id, source: r.source, profile: r.profile) }
             }
             Text(L("Total cost per session (sessions active in range)", "Oturumun toplam maliyeti (aralıkta aktif olanlar)")).font(.caption2).foregroundStyle(.tertiary)
         }
@@ -1938,20 +2206,32 @@ struct TopSessionsView: View {
 struct SessionActions: View {
     let id: String
     let source: String?
-    var body: some View {
-        Button(L("Copy session ID", "Oturum ID'sini kopyala")) { copy(id) }
-        Button(L("Copy resume command", "Devam komutunu kopyala")) {
-            // single-quoted so an odd session id can't turn into extra shell commands when pasted
-            let arg = "'" + id.replacingOccurrences(of: "'", with: "'\\''") + "'"
-            copy(source == "claude-code" ? "claude --resume \(arg)" : source == "copilot-cli" ? "copilot --resume \(arg)" : "hermes --resume \(arg)")
+    var profile: String? = nil
+    var open: OpenAction? = nil
+
+    /// Resume command: the server's (profile-aware) one when the row has it, else built here with the profile.
+    var resumeCommand: String {
+        if let o = open {
+            if o.kind == "kanban-card" { if let c = o.sessionCommand { return c } } else if let c = o.command { return c }
         }
+        // single-quoted so an odd session id can't turn into extra shell commands when pasted
+        let arg = "'" + id.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        if source == "claude-code" { return "claude --resume \(arg)" }
+        if source == "copilot-cli" { return "copilot --resume \(arg)" }
+        let p = (profile ?? "").isEmpty || profile == "default" ? "" : "-p '\(profile!.replacingOccurrences(of: "'", with: "'\\''"))' "
+        return "hermes \(p)--resume \(arg)"
+    }
+
+    var body: some View {
+        if let o = open, o.canOpen {
+            Button(o.url != nil ? L("Open", "Aç") : L("Open (copies the command)", "Aç (komutu kopyalar)")) { Opener.open(o) }
+        }
+        Button(L("Copy session ID", "Oturum ID'sini kopyala")) { copy(id) }
+        Button(L("Copy resume command", "Devam komutunu kopyala")) { copy(resumeCommand) }
         Button(L("Open dashboard", "Paneli aç")) { openPanel() }
     }
 
-    func copy(_ text: String) {
-        NSPasteboard.general.clearContents()
-        NSPasteboard.general.setString(text, forType: .string)
-    }
+    func copy(_ text: String) { Opener.copy(text) }
 }
 
 // ---------- kanban tab ----------
@@ -1974,15 +2254,19 @@ struct BoardView: View {
     let board: Board
     var body: some View {
         let now = Date().timeIntervalSince1970
-        let active = board.cards.filter { $0.status == "running" || $0.status == "blocked" || ($0.consecutiveFailures ?? 0) > 0 }
+        let active = board.cards.filter { ["running", "blocked", "review"].contains($0.status) || ($0.consecutiveFailures ?? 0) > 0 }
             .sorted { rank($0) < rank($1) }
         let recentDone = board.cards.filter { $0.status == "done" }.sorted { ($0.completedAt ?? 0) > ($1.completedAt ?? 0) }.prefix(5)
         VStack(alignment: .leading, spacing: 8) {
             Text(board.board).font(.headline)
             FlowChips(counts: board.counts)
-            SectionTitle(text: L("Running / problems", "Çalışan / sorunlu"))
+            if let k = board.blockedByKind, (board.counts["blocked"] ?? 0) > 0 {
+                Text(L("Blocked: \(Int(k["needs_input"] ?? 0)) need your input · \(Int(k["other"] ?? 0)) other", "Bloklu: \(Int(k["needs_input"] ?? 0)) girdi bekliyor · \(Int(k["other"] ?? 0)) diğer"))
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            SectionTitle(text: L("Running / waiting / problems", "Çalışan / bekleyen / sorunlu"), trailing: L("click a card to open it", "karta tıkla: aç"))
             if active.isEmpty {
-                Text(L("No running or failing cards right now", "Şu an çalışan ya da sorunlu kart yok")).font(.callout).foregroundStyle(.secondary)
+                Text(L("No running, waiting or failing cards right now", "Şu an çalışan, bekleyen ya da sorunlu kart yok")).font(.callout).foregroundStyle(.secondary)
             }
             ForEach(active) { c in CardRow(card: c, now: now) }
             if !recentDone.isEmpty {
@@ -1994,7 +2278,9 @@ struct BoardView: View {
         .background(.quaternary.opacity(0.4), in: RoundedRectangle(cornerRadius: 10))
     }
 
-    func rank(_ c: Card) -> Int { c.status == "blocked" ? 0 : (c.consecutiveFailures ?? 0) > 0 ? 1 : 2 }
+    func rank(_ c: Card) -> Int {
+        c.blockKind == "needs_input" ? 0 : c.status == "blocked" ? 1 : c.status == "review" ? 2 : (c.consecutiveFailures ?? 0) > 0 ? 3 : 4
+    }
 }
 
 struct FlowChips: View {
@@ -2012,6 +2298,7 @@ struct FlowChips: View {
         switch k {
         case "running": return .green
         case "blocked": return .red
+        case "review": return .purple
         case "ready": return .blue
         case "done", "archived": return .secondary
         default: return .orange
@@ -2029,16 +2316,24 @@ struct CardRow: View {
                 Text(card.title ?? card.id).lineLimit(2)
                 Text([card.assignee, meta].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary)
+                if card.blockKind == "needs_input" {
+                    Text(L("waiting for your input", "girdi bekliyor")).font(.caption2.weight(.semibold)).foregroundStyle(.orange)
+                } else if card.status == "review" {
+                    Text(L("waiting for review", "inceleme bekliyor")).font(.caption2.weight(.semibold)).foregroundStyle(.purple)
+                }
                 if let e = card.lastFailureError, !e.isEmpty {
                     Text(e).font(.caption2).foregroundStyle(.red).lineLimit(2)
                 }
             }
+            Spacer(minLength: 0)
         }
         .font(.callout)
+        .openable(card.open)
+        .help(card.open?.canOpen == true ? L("Click: opens the Hermes board and copies the card command (Hermes has no per-card link)", "Tıkla: Hermes panosunu açar, kart komutunu kopyalar (Hermes'te karta özel bağlantı yok)") : "")
     }
 
     var dot: Color {
-        card.status == "blocked" ? .red : (card.consecutiveFailures ?? 0) > 0 ? .orange : card.status == "running" ? .green : .secondary
+        card.blockKind == "needs_input" ? .orange : card.status == "review" ? .purple : card.status == "blocked" ? .red : (card.consecutiveFailures ?? 0) > 0 ? .orange : card.status == "running" ? .green : .secondary
     }
 
     var meta: String? {
@@ -2058,7 +2353,7 @@ struct HealthTab: View {
         if let h = store.health {
             VStack(alignment: .leading, spacing: 12) {
                 Picker("", selection: $view) {
-                    Text(L("Accounts (\(h.accounts.count))", "Hesaplar (\(h.accounts.count))")).tag("accounts")
+                    Text(L("Providers (\(h.accounts.count))", "Sağlayıcılar (\(h.accounts.count))")).tag("accounts")
                     Text(L("Models", "Modeller") + " (\(h.models.filter { $0.status != "idle" }.count))").tag("models")
                     Text(L("Fallbacks", "Yedekler") + " (\(h.chains.filter { $0.usable == 0 }.count) ⚠)").tag("chains")
                 }
@@ -2077,6 +2372,14 @@ struct HealthTab: View {
     }
 }
 
+/// /api/health still carries the English reason text (no code field there): render it in the app language.
+func unavailableText(_ u: String) -> String {
+    guard u.hasPrefix("usage not readable") else { return u }
+    let http = u.range(of: #"HTTP \d+"#, options: .regularExpression).map { " (" + u[$0] + ")" } ?? ""
+    return L("Usage not readable\(http) — the credential lacks permission or the provider did not answer",
+             "Kullanım okunamıyor\(http) — kimlik bilgisinin izni yetmiyor ya da sağlayıcı yanıt vermedi")
+}
+
 func credState(_ c: Cred, now: Double) -> (String, Color) {
     if c.locked { return (L("limit reached", "limit doldu"), .red) }
     if c.status == "exhausted" { return (L("will retry", "tekrar denenecek"), .orange) }
@@ -2093,7 +2396,11 @@ struct AccountCard: View {
             HStack {
                 Text(pName(acc.provider)).font(.headline)
                 Spacer()
-                Chip(text: acc.credentials.isEmpty ? L("no account", "hesap yok") : L("\(usable)/\(acc.credentials.count) usable", "\(usable)/\(acc.credentials.count) kullanılabilir"),
+                // "1 account · 2 credentials · 2 usable": a credential is not an account
+                Chip(text: acc.credentials.isEmpty ? L("no credentials", "kimlik bilgisi yok")
+                        : (acc.accounts_count.map { plural($0, "account", "accounts", tr: "hesap") + " · " } ?? "")
+                            + plural(acc.credentials.count, "credential", "credentials", tr: "kimlik bilgisi") + " · "
+                            + L("\(usable) usable", "\(usable) kullanılabilir"),
                      color: usable == 0 ? .red : states.contains { $0.1 != .green } ? .orange : .green)
             }
             if !acc.profiles.isEmpty || !acc.fallback_for.isEmpty {
@@ -2110,7 +2417,7 @@ struct AccountCard: View {
                 Text(L("No profile uses this provider", "Hiçbir profil bu sağlayıcıyı kullanmıyor")).font(.caption).foregroundStyle(.secondary)
             }
             if let p = acc.plan { Text("Plan: \(p)").font(.caption) }
-            if let u = acc.unavailable { Text(u).font(.caption).foregroundStyle(.secondary) }
+            if let u = acc.unavailable { Text(unavailableText(u)).font(.caption).foregroundStyle(.secondary) }
             ForEach(acc.windows.filter { $0.used != nil }, id: \.label) { w in
                 QuotaRow(window: w, burn: nil, now: now)
             }
@@ -2131,10 +2438,11 @@ struct CredRow: View {
         let st = credState(c, now: now)
         VStack(alignment: .leading, spacing: 3) {
             HStack {
-                Text(c.label ?? L("account", "hesap")).font(.callout.weight(.medium))
-                Text([c.auth_type, c.source].compactMap { $0 }.joined(separator: " · "))
+                Text(c.label ?? L("credential", "kimlik bilgisi")).font(.callout.weight(.medium))
+                Text([c.auth_type, credKind(c.source)].compactMap { $0 }.filter { !$0.isEmpty }.joined(separator: " · "))
                     .font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 Spacer()
+                if c.verification == "unverified" { Chip(text: L("account unverified", "hesabı doğrulanamadı"), color: .orange) }
                 Chip(text: st.0, color: st.1)
             }
             if c.status == "exhausted" || c.error_code != nil {
@@ -2152,7 +2460,7 @@ struct CredRow: View {
                 Text(L("⏳ \(m) cooling down — \(when(until, now: now))", "⏳ \(m) beklemede — \(when(until, now: now))")).font(.caption).foregroundStyle(.orange)
             }
             HStack(spacing: 10) {
-                if let r = c.requests { Text(L("\(Int(r)) requests", "\(Int(r)) istek")) }
+                // (the pool's request counter is not shown: it does not reflect real usage)
                 if let e = c.expires_at {
                     Text(e > now ? L("token valid for \(span(e - now))", "token \(span(e - now)) geçerli") : L("token expired (refreshes)", "token süresi doldu (yenilenir)"))
                 }
@@ -2377,6 +2685,7 @@ struct IslandEvent: Identifiable {
     let detail: String
     let tint: Color
     let gauge: Double?
+    var open: OpenAction? = nil   // a click on the event opens this (session / card)
 }
 
 @MainActor
@@ -2677,7 +2986,10 @@ struct IslandView: View {
             // hover grows with its grouped session tree (capped); other modes keep their fixed height
             .frame(width: sz.width, height: island.mode == .hover ? nil : sz.height)
             .contentShape(Rectangle())
-            .onTapGesture(perform: onClick)
+            .onTapGesture {
+                // an alert about a session / card: its click opens that, not the generic panel
+                if let o = island.event?.open, o.canOpen { Opener.open(o) } else { onClick() }
+            }
             Spacer(minLength: 0)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
@@ -2711,12 +3023,13 @@ struct IslandView: View {
                         .minimumScaleFactor(0.7).lineLimit(1)
                 } else if rightEar == "sessions" {
                     // sessions waiting for your approval first (orange), then working (pulsing), then a dim "+n"
-                    let approvals = store.mains.filter { $0.state == "needs_approval" }.count
+                    let c = store.counts
+                    let approvals = c.needsApproval
                     if approvals > 0 {
                         Image(systemName: "hand.raised.fill").font(.system(size: 10, weight: .semibold)).foregroundStyle(.orange)
                         Text("\(approvals)").font(.system(size: 12, weight: .semibold, design: .rounded)).foregroundStyle(.orange)
                     }
-                    let working = store.workingMains.count, idle = store.mains.count - store.workingMains.count - approvals
+                    let working = c.working, idle = max(0, c.open - c.working - approvals)
                     if working > 0 { PulseDot(color: .green, animated: island.mode != .compact).frame(width: 6, height: 6) }
                     else { Circle().fill(idle > 0 ? Color.green.opacity(0.45) : .gray).frame(width: 6, height: 6) }
                     Text("\(working)").font(.system(size: 13, weight: .semibold, design: .rounded)).monospacedDigit()
@@ -2775,31 +3088,60 @@ struct IslandView: View {
             }
             HStack(spacing: 10) {
                 if hoverSessions {
-                    let working = store.workingMains.count, idle = store.mains.count - store.workingMains.count
-                    Label(L("\(working) working", "\(working) çalışıyor"), systemImage: "bolt.horizontal.circle.fill")
-                        .foregroundStyle(working == 0 ? .gray : .green)
-                    if idle > 0 {
-                        Text(L("\(idle) waiting", "\(idle) bekliyor")).foregroundStyle(.white.opacity(0.5))
+                    let c = store.counts
+                    Label(L("\(c.working) working", "\(c.working) çalışıyor"), systemImage: "bolt.horizontal.circle.fill")
+                        .foregroundStyle(c.working == 0 ? .gray : .green)
+                    if c.needsApproval > 0 {
+                        Text(L("\(c.needsApproval) needs approval", "\(c.needsApproval) onay bekliyor")).foregroundStyle(.orange).fontWeight(.semibold)
+                    }
+                    if c.yourTurn > 0 {
+                        Text(L("\(c.yourTurn) your turn", "\(c.yourTurn) sıra sende")).foregroundStyle(.white.opacity(0.6))
+                    }
+                    if c.stalled > 0 {
+                        Text(L("\(c.stalled) stalled?", "\(c.stalled) takıldı mı?")).foregroundStyle(.yellow.opacity(0.8))
                     }
                 }
                 if hoverCost, let m = store.month {
                     Text(L("today ", "bugün ") + money(store.spend(m, day: isoDay(0)))).foregroundStyle(.white.opacity(0.8))
                 }
                 Spacer()
-                Text(L("click for details", "detay için tıkla")).foregroundStyle(.white.opacity(0.45))
+                Text(L("click a row to open it", "satıra tıkla: aç")).foregroundStyle(.white.opacity(0.45))
             }
             .font(.system(size: 11))
+            // an alert that is still on (it takes over the hover): click opens its session / card
+            if let e = island.event, let o = e.open, o.canOpen {
+                HStack(spacing: 8) {
+                    Image(systemName: e.symbol).foregroundStyle(e.tint)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(e.title).font(.system(size: 11.5, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
+                        Text(e.detail).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
+                    }
+                    Spacer(minLength: 4)
+                    Image(systemName: o.url != nil ? "arrow.up.forward.square" : "doc.on.doc").foregroundStyle(.white.opacity(0.6))
+                }
+                .padding(.vertical, 4).padding(.horizontal, 8)
+                .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
+                .openable(o)
+            }
+            if hoverSessions && !store.approvals.isEmpty {
+                ApprovalBanner(items: store.approvals, now: store.live?.now ?? Date().timeIntervalSince1970, dense: true)
+            }
+            if let t = store.toast {
+                Text(t).font(.system(size: 10.5)).foregroundStyle(.white).lineLimit(3)
+                    .padding(.vertical, 4).padding(.horizontal, 8)
+                    .background(Color.white.opacity(0.16), in: RoundedRectangle(cornerRadius: 8))
+            }
             if hoverSessions && !store.mains.isEmpty {
                 Rectangle().fill(Color.white.opacity(0.12)).frame(height: 1).padding(.vertical, 1)
                 // all sessions, scrollable (the island takes mouse events while hovered)
                 ScrollView(.vertical, showsIndicators: store.mains.count > HOVER_SESSION_CAP) {
-                    AccountGroups(mains: store.mains, subs: store.subs, now: store.live?.now ?? Date().timeIntervalSince1970, dense: true)
+                    SessionGroups(mains: store.mains, subs: store.subs, now: store.live?.now ?? Date().timeIntervalSince1970, dense: true)
                         .padding(.trailing, 6)
                         .environment(\.calmMotion, true)
                 }
                 .frame(maxHeight: .infinity)
             } else if hoverSessions {
-                Text(L("No sessions running", "Çalışan oturum yok")).font(.system(size: 11)).foregroundStyle(.white.opacity(0.45))
+                Text(L("No open sessions", "Açık oturum yok")).font(.system(size: 11)).foregroundStyle(.white.opacity(0.45))
             }
         }
         .padding(.horizontal, 20)
@@ -3028,7 +3370,7 @@ struct SettingsTab: View {
                 Picker("", selection: $rightEar) {
                     Text(L("Sessions", "Oturum")).tag("sessions")
                     Text(L("Tokens/min", "Token/dk")).tag("tokens")
-                    Text(L("Cost", "Maliyet")).tag("cost")
+                    Text(L("API cost", "API karşılığı")).tag("cost")
                     Text(L("None", "Yok")).tag("none")
                 }
             }
@@ -3205,6 +3547,16 @@ struct Popover: View {
             .padding(.horizontal, 14).padding(.vertical, 10)
         }
         .frame(width: 430)
+        .overlay(alignment: .bottom) {
+            if let t = store.toast {
+                Text(t).font(.caption).foregroundStyle(.white).lineLimit(4).multilineTextAlignment(.leading)
+                    .padding(.vertical, 6).padding(.horizontal, 10)
+                    .background(Color.black.opacity(0.85), in: RoundedRectangle(cornerRadius: 8))
+                    .padding(.bottom, 52).padding(.horizontal, 14)
+                    .transition(.opacity)
+                    .accessibilityLabel(t)
+            }
+        }
         .environment(\.locale, appLocale())
         .id(lang)  // rebuild every view when the language changes
         .onAppear { store.refreshAll() }

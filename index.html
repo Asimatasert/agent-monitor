@@ -169,8 +169,33 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space:
 .empty { color: var(--muted); padding: 14px 0; font-size: 13px; }
 .note { font-size: 12px; color: var(--muted); margin-top: 6px; }
 .spark { display: block; }
+/* click-to-open rows: same look, plus hover/focus feedback and an "open" hint */
+.clickable { cursor: pointer; }
+.clickable:hover { background: var(--surface-2); }
+.clickable:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.orow { border-radius: 8px; padding: 4px 6px; margin: -4px -6px; }
+.go { margin-left: auto; font-size: 11.5px; color: var(--text-2); white-space: nowrap; }
+.clickable:hover .go, .clickable:focus-visible .go { color: var(--accent); text-decoration: underline; text-underline-offset: 2px; }
+.orow.appr, .jobrow.appr { background: color-mix(in srgb, var(--serious) 14%, transparent); box-shadow: inset 3px 0 0 var(--serious); }
+.orow.appr:hover, .jobrow.appr:hover { background: color-mix(in srgb, var(--serious) 22%, transparent); }
+.node.appr { border-color: var(--serious); }
+.status.appr { color: var(--text); font-weight: 650; }
+.banner { border: 1px solid var(--serious); border-radius: 12px; padding: 10px 14px; background: color-mix(in srgb, var(--serious) 10%, var(--surface)); }
+.banner h3 { margin: 0 0 6px; font-size: 13.5px; }
+.jobs { display: grid; gap: 2px; }
+.jobrow { display: flex; align-items: center; gap: 10px; padding: 6px 8px; border-radius: 8px; min-width: 0; }
+.jobrow .title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.jobrow .who { color: var(--muted); font-size: 12px; white-space: nowrap; }
+.kcard.clickable:hover { border-color: var(--muted); background: var(--surface-2); }
+.kcard .chips { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 4px; }
+.toast { position: fixed; left: 50%; bottom: 22px; transform: translateX(-50%); z-index: 60; max-width: min(560px, calc(100vw - 24px));
+         background: var(--text); color: var(--bg); border-radius: 10px; padding: 9px 14px; font-size: 12.5px; box-shadow: 0 6px 22px rgba(0,0,0,.25);
+         opacity: 0; pointer-events: none; transition: opacity .2s; }
+.toast.show { opacity: 1; }
+nav a .badge.warn { background: var(--serious); color: #000; font-weight: 650; }
 @media (max-width: 860px) {
   .app { grid-template-columns: 1fr; }
+  .jobrow { flex-wrap: wrap; }
   nav { position: static; height: auto; flex-direction: row; overflow-x: auto; padding: 8px; }
   .brand, nav .foot, .side { display: none; }
   nav a { white-space: nowrap; }
@@ -194,7 +219,7 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space:
       <span class="custom" id="custom">
         <input type="date" class="ctl" id="from"> – <input type="date" class="ctl" id="to">
       </span>
-      <select class="ctl" id="profile"><option value="">Tüm ajanlar</option></select>
+      <select class="ctl" id="profile"><option value="">Tüm profiller</option></select>
       <span class="meta" id="meta"></span>
     </div>
     <div class="filters" id="filters">
@@ -216,6 +241,7 @@ td.n, th.n { text-align: right; font-variant-numeric: tabular-nums; white-space:
   </main>
 </div>
 <div class="tip" id="tip"></div>
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
 <script>
 // ---------- utilities ----------
 const $ = id => document.getElementById(id);
@@ -272,6 +298,59 @@ const store = {
   set(k, v) { try { localStorage.setItem('hm:' + k, JSON.stringify(v)); } catch {} },
 };
 
+// ---------- strings (Turkish UI texts used by the open / state features) ----------
+const T = {
+  open: 'Aç ↗', copy: 'Komutu kopyala', openCard: 'Panoyu aç + komutu kopyala', nothing: 'Bu satır için açılacak bir yer yok.',
+  opening: label => `Açılıyor: ${label}`,
+  copied: cmd => `Komut kopyalandı — Terminal'de çalıştır: ${cmd}`,
+  copyFailed: cmd => `Kopyalanamadı. Komut: ${cmd}`,
+  cardNoRoute: (copied, cmd) => 'Karta özel bağlantı yok: Hermes panosu açıldı' + (copied ? `, kart komutu kopyalandı: ${cmd}` : ''),
+  tipOpen: 'Tıkla: aç · Shift+tık: komutu kopyala', tipCopy: 'Tıkla: komutu kopyala',
+  noOpen: 'Şu an açık iş yok.',
+  approvalTitle: n => `${n} iş onay bekliyor`, approvalHint: 'satıra tıklayınca ilgili oturum açılır',
+};
+const ORIGIN_NAME = { desktop: 'masaüstü', cli: 'CLI', tui: 'TUI', kanban: 'kanban işçisi', telegram: 'Telegram', slack: 'Slack', cron: 'zamanlanmış', 'claude-code': null, 'copilot-cli': null };
+const originName = o => o in ORIGIN_NAME ? ORIGIN_NAME[o] : o;
+
+// ---------- open action: url when the server verified a scheme, else copy the command ----------
+let toastTimer = null;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg; el.classList.add('show');
+  clearTimeout(toastTimer); toastTimer = setTimeout(() => el.classList.remove('show'), 4500);
+}
+async function copyText(t) {
+  try { await navigator.clipboard.writeText(t); return true; } catch {}
+  const ta = h('textarea', { style: 'position:fixed;opacity:0;left:-999px' }); ta.value = t; document.body.append(ta); ta.select();
+  let ok = false; try { ok = document.execCommand('copy'); } catch {}
+  ta.remove(); return ok;
+}
+function launchUrl(u) { const a = h('a', { href: u }); document.body.append(a); a.click(); a.remove(); }
+const canOpen = o => !!o && o.kind !== 'none' && !!(o.url || o.command);
+/** One rule for every row (Live, Özet, sidebar, kanban): url -> open it; no url -> copy the command and say so. */
+async function openAction(o, ev) {
+  if (!canOpen(o)) { toast(T.nothing); return; }
+  const cmd = o.command;
+  if (o.kind === 'kanban-card') {          // Hermes has no per-card route: open the board AND copy the card command
+    const copied = cmd ? await copyText(cmd) : false;
+    if (o.url) { launchUrl(o.url); toast(T.cardNoRoute(copied, cmd)); } else toast(copied ? T.copied(cmd) : T.copyFailed(cmd));
+    return;
+  }
+  if (o.url && !(ev && ev.shiftKey && cmd)) { launchUrl(o.url); toast(T.opening(o.label || o.url)); return; }
+  const copied = await copyText(cmd);
+  toast(copied ? T.copied(cmd) : T.copyFailed(cmd));
+}
+/** Make an element behave as a button that runs openAction (mouse + Enter/Space). */
+function openable(el, o) {
+  if (!canOpen(o)) return el;
+  el.classList.add('clickable'); el.setAttribute('role', 'button'); el.tabIndex = 0;
+  el.setAttribute('title', (o.label ? o.label + ' — ' : '') + (o.url ? T.tipOpen : T.tipCopy));
+  el.addEventListener('click', ev => { if (ev.target.closest('a[href], button')) return; ev.preventDefault(); openAction(o, ev); });
+  el.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openAction(o, ev); } });
+  return el;
+}
+const openHint = o => !canOpen(o) ? null : h('span', { class: 'go' }, o.kind === 'kanban-card' ? T.openCard : o.url ? T.open : T.copy);
+
 // Color follows the entity (provider), never its rank.
 const PROVIDER_SLOT = { 'anthropic': 's1', 'openai-codex': 's2', 'nvidia': 's3', 'gemini': 's4', 'copilot': 's5' };
 const PROVIDER_NAME = { 'anthropic': 'Anthropic (Claude)', 'openai-codex': 'OpenAI Codex', 'nvidia': 'NVIDIA', 'gemini': 'Google Gemini',
@@ -283,7 +362,14 @@ const SOURCE_NAME = { 'hermes': 'Hermes', 'claude-code': 'Claude Code', 'copilot
 const srcColor = k => `var(--${SOURCE_SLOT[k] || 'other'})`;
 const srcName = k => SOURCE_NAME[k] || k;
 // "anthropic#work" = one of several accounts of a provider
-const pName = p => { const [b, acct] = String(p).split('#'); const n = PROVIDER_NAME[b] || b; return acct ? `${n} · ${acct}` : n; };
+let MULTI = new Set();   // providers with >= 2 account items (set by noteQuotaItems)
+const pBase = p => String(p).split('#')[0];
+function noteQuotaItems(items) {
+  const c = {}; (items || []).forEach(it => { c[pBase(it.provider)] = (c[pBase(it.provider)] || 0) + 1; });
+  MULTI = new Set(Object.keys(c).filter(k => c[k] > 1));
+}
+const pShort = p => (PROVIDER_NAME[pBase(p)] || pBase(p)).split(' ')[0] + (String(p).includes('#') && MULTI.has(pBase(p)) ? ' ' + String(p).split('#')[1] : '');
+const pName = p => { const [b, acct] = String(p).split('#'); const n = PROVIDER_NAME[b] || b; return acct && MULTI.has(b) ? `${n} · ${acct}` : n; };
 
 // Status: reserved colors, always with icon + label.
 const ICONS = {
@@ -293,7 +379,11 @@ const STATUS = {
   running: ['çalışıyor', 'good', 'run'], ok: ['aktif', 'good', 'good'], done: ['bitti', 'muted', 'good'], agent_close: ['bitti', 'muted', 'good'],
   ended: ['bitti', 'muted', 'good'], blocked: ['bloklu', 'warn', 'warn'], exhausted: ['limit doldu', 'critical', 'critical'],
   interrupted: ['kesildi', 'serious', 'warn'], failed: ['hata', 'critical', 'critical'], error: ['hata', 'critical', 'critical'],
-  ready: ['hazır', 'muted', 'idle'], todo: ['yapılacak', 'muted', 'idle'], triage: ['triage', 'muted', 'idle'], idle: ['boşta', 'muted', 'idle'],
+  ready: ['hazır', 'muted', 'idle'], todo: ['yapılacak', 'muted', 'idle'], triage: ['triaj', 'muted', 'idle'], idle: ['boşta', 'muted', 'idle'],
+  scheduled: ['zamanlandı', 'muted', 'idle'], review: ['incelemede', 'accent', 'idle'], archived: ['arşiv', 'muted', 'idle'],
+  cli_close: ['kapandı', 'muted', 'good'], unknown: ['bilinmiyor', 'muted', 'idle'],
+  // session states (/api/live `state`)
+  working: ['çalışıyor', 'good', 'run'], needs_approval: ['Onay bekliyor', 'serious', 'warn'], waiting: ['Sıra sende', 'accent', 'idle'], stalled: ['Takıldı mı?', 'warn', 'warn'],
 };
 function statusEl(key) {
   const k = String(key || '').toLowerCase();
@@ -301,7 +391,7 @@ function statusEl(key) {
   const color = tone === 'muted' ? 'var(--muted)' : `var(--${tone})`;
   const svg = s('svg', { viewBox: '0 0 24 24', fill: 'none', stroke: color, 'stroke-width': 3, 'stroke-linecap': 'round' }, s('path', { d: ICONS[icon] }));
   if (icon === 'run') svg.innerHTML = '<circle cx="12" cy="12" r="5" fill="' + color + '" stroke="none"/>';
-  return h('span', { class: 'status' }, svg, label);
+  return h('span', { class: 'status' + (k === 'needs_approval' ? ' appr' : '') }, svg, label);
 }
 
 // ---------- tooltip ----------
@@ -509,14 +599,21 @@ function card(title, sub, body, { tableView, cls = '' } = {}) {
 }
 const kpi = (label, value, hint) => h('div', { class: 'card kpi' }, h('div', { class: 'label' }, label), h('div', { class: 'value' }, value), hint ? h('div', { class: 'hint' }, hint) : null);
 
+const WIN_NAME = { 'Current session': 'Oturum', 'Current day': 'Gün', 'Current week': 'Hafta', 'Current month': 'Ay', 'Premium requests': 'Premium istek', 'Opus week': 'Opus hafta', 'Sonnet week': 'Sonnet hafta' };
+const winName = l => WIN_NAME[l] || l;
 function gauge(w) {
   const p = w.used == null ? null : Math.max(0, Math.min(100, w.used));
   const tone = p == null ? 'var(--muted)' : p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
   return h('div', { class: 'gauge' },
-    h('div', { class: 'row' }, h('span', {}, w.label), h('b', {}, p == null ? '—' : fmtPct(p) + ' kullanıldı')),
+    h('div', { class: 'row' }, h('span', {}, winName(w.label)), h('b', {}, p == null ? '—' : fmtPct(p) + ' kullanıldı')),
     h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })),
     h('div', { class: 'sub', style: 'font-size:11.5px' }, [until(w.reset), w.detail].filter(Boolean).join(' · ')));
 }
+
+const CRED_KIND = src => /^env:/.test(src || '') ? 'ortam değişkeni' : src === 'claude_code' ? 'Claude Code girişi' : src === 'gh_cli' ? 'GitHub CLI' : (src || '');
+const unavailText = it => it.unavailable_code === 'usage_unreadable'
+  ? `Kullanım okunamıyor${it.unavailable_http ? ' (HTTP ' + it.unavailable_http + ')' : ''} — kimlik bilgisinin izni yetmiyor ya da sağlayıcı yanıt vermiyor.` : it.unavailable;
+const unverifiedWhy = a => `Bu kimlik bilgisinin hangi hesaba ait olduğu okunamadı${a.http ? ' (HTTP ' + a.http + ')' : ''}; aynı hesap olup olmadığı bilinmiyor.`;
 
 function quotaCard(it, burn = []) {
   const kids = [];
@@ -527,16 +624,22 @@ function quotaCard(it, burn = []) {
       `Saatte +%${b.per_hour.toFixed(1)}` + (b.eta_full ? ` · bu hızla ${new Date(b.eta_full * 1000).toLocaleString('tr-TR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })} dolar` : '')));
   });
   it.details.forEach(d => kids.push(h('div', { class: 'note' }, d)));
-  if (it.unavailable) kids.push(h('div', { class: 'note' }, it.unavailable));
+  if (it.unavailable) kids.push(h('div', { class: 'note' }, unavailText(it)));
   if (!it.windows.length && !it.details.length && !it.unavailable) {
     const exhausted = it.accounts.some(a => a.status === 'exhausted');
-    kids.push(h('div', { class: 'note' }, exhausted ? 'Limit dolu olduğu için kota bilgisi alınamıyor.' : 'Bu sağlayıcı kota bilgisi vermiyor.'));
+    kids.push(h('div', { class: 'note' }, exhausted ? 'Limit dolu olduğu için kota bilgisi alınamıyor.' : 'Kota bilgisi alınamadı ya da bu sağlayıcı kota penceresi sunmuyor.'));
   }
+  // one row per credential (a credential is not an account: several can belong to the same account)
   it.accounts.forEach((a, i) => kids.push(h('div', { class: 'acct', style: i === 0 ? 'margin-top:10px' : '' },
-    h('span', {}, a.label || a.source), h('span', { style: 'display:flex;gap:10px;align-items:center' }, h('span', { class: 'sub' }, fmtN(a.requests) + ' istek'), statusEl(a.status || 'ok')))));
+    h('span', {}, a.label || a.source, h('span', { class: 'sub' }, ' · ' + CRED_KIND(a.source))),
+    h('span', { style: 'display:flex;gap:10px;align-items:center' },
+      a.verification === 'unverified' ? h('span', { class: 'chip', title: unverifiedWhy(a) }, 'hesabı doğrulanamadı') : null,
+      statusEl(a.status || 'unknown')))));
+  const unv = it.accounts.filter(a => a.verification === 'unverified');
+  if (unv.length) kids.push(h('div', { class: 'note' }, `${unv.map(a => a.label || a.source).join(', ')}: hangi hesaba ait olduğu okunamadı; bu yüzden ayrı hesap sayılmadı.`));
   return h('div', { class: 'card' },
     h('div', { class: 'card-h' }, h('i', { style: `width:10px;height:10px;border-radius:3px;background:${pColor(it.provider)};display:inline-block` }),
-      h('h3', {}, pName(it.provider)), h('span', { class: 'sub' }, [it.plan, it.accounts.length + ' hesap'].filter(Boolean).join(' · '))), ...kids);
+      h('h3', {}, pName(it.provider)), h('span', { class: 'sub' }, [it.plan, it.account_key ? '1 hesap' : null, it.accounts.length + ' kimlik bilgisi'].filter(Boolean).join(' · '))), ...kids);
 }
 
 // ---------- filters ----------
@@ -601,10 +704,10 @@ const PAGES = [
   { id: 'live', title: 'Canlı', icon: 'M3 12h4l3-8 4 16 3-8h4', live: true },
   { id: 'overview', title: 'Özet', icon: 'M4 20V10M10 20V4M16 20v-7M22 20H2' },
   { id: 'accounts', title: 'Hesaplar & Kotalar', icon: 'M3 7h18v12H3zM3 11h18M7 15h3' },
-  { id: 'agents', title: 'Ajanlar', icon: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0' },
-  { id: 'subagents', title: 'Alt Ajanlar', icon: 'M6 3v6a3 3 0 0 0 3 3h6M6 9v12M15 12l3 3-3 3' },
-  { id: 'clis', title: 'CLI Ajanları', icon: 'M4 17l6-5-6-5M12 19h8' },
-  { id: 'kanban', title: 'Kartlar', icon: 'M4 4h5v16H4zM10 4h5v10h-5zM16 4h4v7h-4z' },
+  { id: 'agents', title: 'Profiller', icon: 'M12 12a4 4 0 1 0 0-8 4 4 0 0 0 0 8zM4 21a8 8 0 0 1 16 0' },
+  { id: 'subagents', title: 'Alt ajanlar', icon: 'M6 3v6a3 3 0 0 0 3 3h6M6 9v12M15 12l3 3-3 3' },
+  { id: 'clis', title: 'CLI oturumları', icon: 'M4 17l6-5-6-5M12 19h8' },
+  { id: 'kanban', title: 'Kanban', icon: 'M4 4h5v16H4zM10 4h5v10h-5zM16 4h4v7h-4z' },
 ];
 const RANGES = [['today', 'Bugün', 0], ['7', '7 gün', 6], ['30', '30 gün', 29], ['90', '90 gün', 89], ['custom', 'Özel', null]];
 const iso = d => d.toLocaleDateString('sv-SE');
@@ -626,7 +729,7 @@ function buildChrome() {
   nav.append(h('div', { class: 'side', id: 'side' }));
   nav.append(h('div', { class: 'foot' },
     h('div', {}, h('span', { class: 'live-dot pulse', id: 'dot' }), ' ', h('span', { id: 'conn' }, 'bağlanıyor…')),
-    h('div', {}, 'Salt-okuma · 127.0.0.1:8777')));
+    h('div', {}, 'Salt-okuma · ' + location.host)));
   const seg = $('ranges');
   RANGES.forEach(([id, label]) => seg.append(h('button', { 'data-r': id, onclick: () => { state.range = id; store.set('range', id); syncControls(); reload(); } }, label)));
   const [f, t] = rangeDates();
@@ -668,6 +771,31 @@ function fillProfiles(names) {
   sel.value = state.profile;
 }
 
+// ---------- session state helpers (one counting rule, from /api/live `counts`) ----------
+const stateKey = r => r.status !== 'running' ? 'ended' : (r.state || 'working');
+const stateRank = r => ({ needs_approval: 0, working: 1, stalled: 2, waiting: 3 })[stateKey(r)] ?? 4;
+const whoName = r => r.source ? (r.source_name || r.profile) : r.profile;
+const stateEl = r => stateKey(r) === 'ended' ? statusEl(r.end_reason || 'ended') : statusEl(stateKey(r));
+const isOpenMain = r => r.status === 'running' && !r.subagent;
+const byAttention = (a, b) => stateRank(a) - stateRank(b) || (b.last || 0) - (a.last || 0);
+function liveCounts(d) {
+  if (d.counts) return d.counts;
+  const m = d.running.filter(isOpenMain), n = k => m.filter(r => stateKey(r) === k).length;
+  return { open: m.length, working: n('working'), needs_approval: n('needs_approval'), your_turn: n('waiting'), stalled: n('stalled'), subagents: d.running.filter(r => r.status === 'running' && r.subagent).length };
+}
+const countLine = c => [`${c.working} çalışıyor`, c.needs_approval ? `${c.needs_approval} onay bekliyor` : null, c.your_turn ? `${c.your_turn} sıra sende` : null, c.stalled ? `${c.stalled} takıldı mı?` : null].filter(Boolean).join(' · ');
+/** Compact clickable line (Özet, approval banner). */
+function jobRow(r) {
+  const row = h('div', { class: 'jobrow' + (stateKey(r) === 'needs_approval' ? ' appr' : '') },
+    stateEl(r), h('span', { class: 'title' }, r.title || '(başlıksız oturum)'),
+    h('span', { class: 'who' }, [r.subagent ? 'alt ajan' : null, whoName(r), originName(r.origin)].filter(Boolean).join(' · ')), openHint(r.open));
+  return openable(row, r.open);
+}
+function openJobsCard(d) {
+  const run = d.running.filter(isOpenMain).sort(byAttention);
+  return card('Açık işler', countLine(liveCounts(d)), run.length ? h('div', { class: 'jobs' }, run.slice(0, 12).map(jobRow)) : h('div', { class: 'empty' }, T.noOpen));
+}
+
 // ---------- live (polls every 1.5 s) ----------
 async function loadLive() {
   clearTimeout(liveTimer);
@@ -677,7 +805,10 @@ async function loadLive() {
     lastLive = d;
     renderLive(d);
     renderSide(d);
-    $('badge-live').textContent = d.running.filter(r => r.status === 'running').length;
+    const c = liveCounts(d), badge = $('badge-live');
+    badge.textContent = c.open; badge.classList.toggle('warn', c.needs_approval > 0);
+    badge.title = countLine(c);
+    if (state.page === 'overview' && $('ov-open')) $('ov-open').replaceChildren(openJobsCard(d));
   } catch (e) {
     if (state.page === 'live') $('meta').textContent = 'bağlantı yok — panel.py çalışıyor mu?';
   }
@@ -696,6 +827,7 @@ function renderSide(d) {
 
   // quotas
   const items = (d.quotas.items || []);
+  noteQuotaItems(items);
   const wins = items.flatMap(it => it.windows.map(w => ({ ...w, provider: it.provider })));
   const bad = items.filter(it => it.accounts.some(a => a.status === 'exhausted'));
   if (wins.length || bad.length) {
@@ -703,9 +835,9 @@ function renderSide(d) {
       wins.map(w => {
         const p = Math.max(0, Math.min(100, w.used || 0));
         const tone = p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
-        const short = { 'Current session': 'Oturum', 'Current day': 'Gün', 'Current week': 'Hafta', 'Current month': 'Ay', 'Premium requests': 'Premium istek', 'Opus week': 'Opus hafta', 'Sonnet week': 'Sonnet hafta' }[w.label] || w.label;
+        const short = winName(w.label);
         return h('div', { class: 'sq', title: `${pName(w.provider)} · ${w.label}` },
-          h('div', { class: 'r' }, h('span', {}, pName(w.provider).split(' ')[0] + (String(w.provider).includes('#') ? ' ' + String(w.provider).split('#')[1] : '') + ' · ' + short), h('b', {}, fmtPct(p))),
+          h('div', { class: 'r' }, h('span', {}, pShort(w.provider) + ' · ' + short), h('b', {}, fmtPct(p))),
           h('div', { class: 'track' }, h('div', { class: 'fill', style: `width:${p}%;background:${tone}` })),
           h('div', { class: 'sub' }, until(w.reset)));
       }),
@@ -719,15 +851,18 @@ function renderSide(d) {
     h('div', { class: 'sub', style: 'font-size:11px' }, `son 60 dk: ${fmtN(d.last_60m)} · ${fmtUsd(d.cost_60m)}`),
     h('div', { style: 'margin-top:6px' }, sparkBars(perMin.slice(-30)))));
 
-  // running sessions
-  const run = d.running.filter(r => r.status === 'running');
-  const now = d.now;
-  parts.push(h('div', {}, h('h5', {}, 'Çalışanlar', h('span', {}, String(run.length))),
-    run.length ? h('div', { class: 'srun' }, run.slice(0, 6).map(r => h('a', { href: '#live', onclick: ev => { ev.preventDefault(); go('live'); } },
-      h('span', { class: 'd live-dot pulse', style: `background:${r.source ? srcColor(r.source) : 'var(--good)'}` }),
-      h('span', { class: 't' }, (r.subagent ? '↳ ' : '') + (r.profile || ''), h('small', {}, r.title || r.activity || '—')),
+  // open sessions: click opens the session (or copies its command)
+  const run = d.running.filter(isOpenMain).sort(byAttention);
+  const now = d.now, cnt = liveCounts(d);
+  const dotStyle = r => ({ needs_approval: 'background:var(--serious)', waiting: 'background:var(--accent)', stalled: 'background:var(--warn)' })[stateKey(r)] || `background:${r.source ? srcColor(r.source) : 'var(--good)'}`;
+  parts.push(h('div', {}, h('h5', {}, 'Açık oturumlar', h('span', {}, String(cnt.open))),
+    run.length ? h('div', { class: 'srun' }, run.slice(0, 6).map(r => h('a', {
+        href: '#live', title: (r.open && canOpen(r.open) ? 'Tıkla: aç' : 'Canlı sayfasına git') + ' — ' + (STATUS[stateKey(r)] || [stateKey(r)])[0],
+        onclick: ev => { ev.preventDefault(); if (canOpen(r.open)) openAction(r.open, ev); else go('live'); } },
+      h('span', { class: 'd live-dot' + (stateKey(r) === 'working' ? ' pulse' : ''), style: dotStyle(r) }),
+      h('span', { class: 't' }, whoName(r), h('small', {}, (stateKey(r) === 'working' ? '' : (STATUS[stateKey(r)] || [''])[0] + ' · ') + (r.title || r.activity || '—'))),
       h('span', { class: 'e' }, dur(now - (r.started || now)).replace(/ \d+ sn$/, '')))))
-      : h('div', { class: 'sub', style: 'font-size:11.5px' }, 'Şu an çalışan yok.')));
+      : h('div', { class: 'sub', style: 'font-size:11.5px' }, T.noOpen)));
 
   // source share, last 60 min
   const src = Object.entries(d.by_source_60m || {}).filter(([, v]) => v > 0);
@@ -752,8 +887,10 @@ function sparkBars(values) {
 function renderLive(d) {
   if (state.page !== 'live') return;
   const page = $('p-live');
+  noteQuotaItems(d.quotas.items);
   const running = d.running.filter(r => r.status === 'running');
-  const runSubs = running.filter(r => r.subagent);
+  const cnt = liveCounts(d);
+  const approvals = running.filter(r => !r.subagent && stateKey(r) === 'needs_approval');
   const warming = !d.sampling_since || d.now - d.sampling_since < 3600;
   const warmMin = d.sampling_since ? Math.floor((d.now - d.sampling_since) / 60) : 0;
   $('meta').textContent = 'güncellendi ' + new Date().toLocaleTimeString('tr-TR');
@@ -762,9 +899,9 @@ function renderLive(d) {
     kpi('Son 1 dk', fmtN(d.last_1m) + ' token'),
     kpi('Son 5 dk', fmtN(d.last_5m) + ' token'),
     kpi('Son 60 dk', fmtN(d.last_60m) + ' token', Object.entries(d.by_source_60m || {}).filter(([, v]) => v).map(([k, v]) => `${srcName(k)} ${fmtN(v)}`).join(' · ') || (warming ? `Hermes ölçümü ${warmMin} dk önce başladı` : null)),
-    kpi('Son 60 dk maliyet', fmtUsd(d.cost_60m), 'tahmini API karşılığı'),
-    kpi('Çalışan oturum', String(running.length - runSubs.length)),
-    kpi('Çalışan alt ajan', String(runSubs.length)));
+    kpi('Son 60 dk API karşılığı', fmtUsd(d.cost_60m), 'tahmini; abonelikte gerçek harcama değil'),
+    kpi('Açık oturum', String(cnt.open), countLine(cnt)),
+    kpi('Alt ajan', String(cnt.subagents), 'çalışan'));
 
   const provs = d.providers.length ? d.providers : [];
   const series = provs.map(p => ({ key: p, label: srcName(p), color: srcColor(p) }));
@@ -775,7 +912,7 @@ function renderLive(d) {
 
   const actSeries = [{ key: 'assistant', label: 'Model yanıtı', color: 'var(--s1)' }, { key: 'tool', label: 'Araç çağrısı', color: 'var(--s2)' }];
   const actCols = d.activity.map(m => ({ label: timeLabel(m.t), tipTitle: timeLabel(m.t), values: { assistant: m.assistant, tool: m.tool } }));
-  const actCard = card('Aktivite / dakika', 'son 60 dk · mesaj sayısı',
+  const actCard = card('Aktivite / dakika', 'son 60 dk · mesaj sayısı (yalnızca Hermes)',
     [legend(actSeries), barChart(actCols, actSeries, { height: 170, labelEvery: 10, key: 'live-act', fmt: v => nfi.format(Math.round(v)) })],
     { tableView: () => table([{ label: 'Dakika', get: r => timeLabel(r.t) }, { label: 'Model yanıtı', n: 1, get: r => r.assistant }, { label: 'Araç çağrısı', n: 1, get: r => r.tool }], d.activity.filter(m => m.assistant || m.tool).reverse()) });
 
@@ -786,40 +923,52 @@ function renderLive(d) {
   // filters: source / status / search
   const liveSrc = r => r.source || 'hermes';
   fOptions('source', d.running.map(liveSrc), srcName);
-  fOptions('status', ['running', 'done'], STATUS_LABEL);
-  const keep = r => fIs('source', liveSrc(r)) && (!fOn('status') || (flt.status === 'running') === (r.status === 'running'))
-    && fMatch(r.title, r.profile, r.model, r.activity, r.parent_title);
+  fOptions('status', ['working', 'needs_approval', 'waiting', 'stalled', 'ended'], STATUS_LABEL);
+  const stOk = r => !fOn('status') || stateKey(r) === flt.status || (flt.status === 'running' && r.status === 'running') || (flt.status === 'done' && r.status !== 'running');
+  const keep = r => fIs('source', liveSrc(r)) && stOk(r)
+    && fMatch(r.title, r.profile, r.source_name, r.model, r.activity, r.parent_title, r.kanban && r.kanban.title);
   const allCount = d.running.length;
   // subagent tree: roots = running non-subagents; children grouped by parent
   const byParent = {};
   d.running.filter(r => r.subagent && keep(r)).forEach(r => (byParent[r.parent] ||= []).push(r));
   const roots = d.running.filter(r => !r.subagent && (keep(r) || byParent[r.id]));
   Object.keys(byParent).forEach(pid => { if (!roots.some(r => r.id === pid)) roots.push({ id: pid, orphan: true, title: byParent[pid][0].parent_title, profile: byParent[pid][0].profile, status: 'idle' }); });
-  roots.sort((a, b) => (b.status === 'running') - (a.status === 'running') || (b.last || 0) - (a.last || 0));
+  roots.sort(byAttention);
   if ((FILTERS.live || []).some(k => flt[k])) fCount(roots.filter(r => !r.orphan).length + Object.values(byParent).flat().length, allCount, 'oturum');
   const node = (r, child) => {
     const key = r.id, flash = prevTokens[key] != null && r.tokens > prevTokens[key];
     prevTokens[key] = r.tokens;
     const elapsed = r.started ? (r.status === 'running' ? d.now - r.started : (r.last || d.now) - r.started) : null;
-    return h('div', { class: child ? 'child' : '' },
-      h('div', { class: 'head' }, statusEl(r.status), h('span', { class: 'title' }, r.title || '(başlıksız oturum)'),
-        h('span', { class: 'chip', style: r.source ? `color:${srcColor(r.source)};font-weight:600` : '' }, r.profile), r.model ? h('span', { class: 'chip' }, r.model) : null),
-      r.orphan ? h('div', { class: 'meta' }, 'ana oturum şu an boşta') : h('div', { class: 'meta' },
-        h('span', {}, h('b', { class: flash ? 'flash' : '' }, fmtN(r.tokens)), ' token'),
-        h('span', {}, h('b', {}, fmtUsd(r.cost))),
-        h('span', {}, h('b', {}, nfi.format(r.tools || 0)), r.source ? ' model çağrısı' : ' araç'),
-        h('span', {}, 'süre ', h('b', {}, dur(elapsed))),
-        h('span', {}, 'son ', ago(r.last))),
-      r.activity ? h('div', { class: 'act', title: r.activity }, '↳ ' + r.activity) : null);
+    const k = stateKey(r), og = originName(r.origin);
+    const meta = r.orphan ? h('div', { class: 'meta' }, 'ana oturum şu an boşta')
+      : r.card_only ? h('div', { class: 'meta' }, h('span', {}, 'bu karta bağlı oturum bulunamadı'), h('span', {}, 'süre ', h('b', {}, dur(elapsed))))
+      : h('div', { class: 'meta' },
+          h('span', {}, h('b', { class: flash ? 'flash' : '' }, fmtN(r.tokens)), ' token'),
+          h('span', {}, h('b', {}, fmtUsd(r.cost))),
+          h('span', {}, h('b', {}, nfi.format(r.tools || 0)), r.source ? ' model çağrısı' : ' araç'),
+          h('span', {}, 'süre ', h('b', {}, dur(elapsed))),
+          h('span', {}, 'son ', ago(r.last)));
+    const act = r.long_tool_call ? 'uzun araç çağrısı sürüyor: ' + r.long_tool_call : r.activity;
+    const row = h('div', { class: 'orow' + (k === 'needs_approval' ? ' appr' : '') },
+      h('div', { class: 'head' }, stateEl(r), h('span', { class: 'title' }, r.title || '(başlıksız oturum)'),
+        h('span', { class: 'chip', style: r.source ? `color:${srcColor(r.source)};font-weight:600` : '' }, whoName(r)),
+        og ? h('span', { class: 'chip' }, og) : null,
+        r.kanban ? h('span', { class: 'chip', title: r.kanban.title }, 'kart ' + r.kanban.id) : null,
+        r.model ? h('span', { class: 'chip' }, r.model) : null, openHint(r.open)),
+      meta, act ? h('div', { class: 'act', title: act }, '↳ ' + act) : null);
+    return h('div', { class: child ? 'child' : '' }, openable(row, r.open));
   };
-  const tree = roots.length ? h('div', { class: 'tree' }, roots.map(r => h('div', { class: 'node root' }, node(r),
-    byParent[r.id] ? h('div', { class: 'children' }, byParent[r.id].sort((a, b) => (b.status === 'running') - (a.status === 'running') || (b.last || 0) - (a.last || 0)).map(c => node(c, true))) : null)))
-    : h('div', { class: 'empty' }, (FILTERS.live || []).some(k => flt[k]) ? 'Filtreye uyan oturum yok.' : 'Şu an çalışan oturum yok.');
-  const treeCard = card('Çalışan oturumlar ve alt ajanlar', `${running.length} çalışıyor · son 15 dk'da biten alt ajanlar dahil`, tree);
+  const tree = roots.length ? h('div', { class: 'tree' }, roots.map(r => h('div', { class: 'node root' + (stateKey(r) === 'needs_approval' ? ' appr' : '') }, node(r),
+    byParent[r.id] ? h('div', { class: 'children' }, byParent[r.id].sort(byAttention).map(c => node(c, true))) : null)))
+    : h('div', { class: 'empty' }, (FILTERS.live || []).some(k => flt[k]) ? 'Filtreye uyan oturum yok.' : T.noOpen);
+  const treeCard = card('Açık oturumlar ve alt ajanlar', `${countLine(cnt)} · son 15 dk'da biten alt ajanlar dahil`, tree);
+  const banner = approvals.length ? h('div', { class: 'banner', role: 'region', 'aria-label': T.approvalTitle(approvals.length) },
+    h('h3', {}, T.approvalTitle(approvals.length), h('span', { class: 'sub', style: 'font-weight:400' }, ' — ' + T.approvalHint)),
+    h('div', { class: 'jobs' }, approvals.map(jobRow))) : null;
 
-  const byProf = card('Ajan bazında tüketim', 'son 60 dk', hBars(d.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) }))));
+  const byProf = card('Profil bazında tüketim', 'son 60 dk', hBars(d.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) }))));
 
-  page.replaceChildren(h('div', { class: 'stack' }, kpis, treeCard, h('div', { class: 'grid g2' }, tokCard, actCard), quotaCardEl, byProf));
+  page.replaceChildren(h('div', { class: 'stack' }, banner, kpis, treeCard, h('div', { class: 'grid g2' }, tokCard, actCard), quotaCardEl, byProf));
 }
 
 // ---------- range pages ----------
@@ -865,23 +1014,24 @@ function usageFor(u0) {
 }
 
 function renderOverview(d) {
+  noteQuotaItems(d.quotas.items);
   const u = usageFor(d.usage), t = u.totals;
   fillProfiles(d.agents.map(a => a.name));
   const kpis = h('div', { class: 'grid g-kpi' },
-    kpi('Toplam token', fmtN(t.tokens), `${fmtN(t.input)} girdi · ${fmtN(t.output)} çıktı`),
-    kpi('Maliyet', fmtUsd(t.cost), 'tahmini API karşılığı'),
-    kpi('Oturum', nfi.format(t.sessions), `${nfi.format(t.subagents)} alt ajan`),
+    kpi('Hermes token', fmtN(t.tokens), `yalnızca Hermes · ${fmtN(t.input)} girdi · ${fmtN(t.output)} çıktı`),
+    kpi('Hermes API karşılığı', fmtUsd(t.cost), 'tahmini; abonelikte gerçek harcama değil'),
+    kpi('Hermes oturumu', nfi.format(t.sessions), `${nfi.format(t.subagents)} alt ajan`),
     kpi('API çağrısı', fmtN(t.calls)),
     kpi('Araç çağrısı', fmtN(t.tool_calls)),
     kpi('Önbellekten okunan', fmtN(t.cache_read), 'token'));
   const share = card('Sağlayıcı payı', 'token', shareBar(u.by_provider.map(p => ({ label: pName(p.provider), value: p.tokens, color: pColor(p.provider) }))));
   const models = card('En çok kullanılan modeller', 'token', hBars(u.by_model.map(m => ({ label: m.model, value: m.tokens, sub: pName(m.provider), color: pColor(m.provider) }))),
     { tableView: () => table([{ label: 'Model', get: r => r.model }, { label: 'Sağlayıcı', get: r => pName(r.provider) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) }, { label: 'Çağrı', n: 1, get: r => fmtN(r.calls) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) }], u.by_model) });
-  const agents = card('Ajanlar', 'token', hBars(u.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) })), { max: 13 }));
+  const agents = card('Profiller', 'token', hBars(u.by_profile.map(p => ({ label: p.profile, value: p.tokens, sub: fmtUsd(p.cost) })), { max: 13 }));
   const quotas = card('Kotalar', 'şu an', h('div', { class: 'grid g3' }, (d.quotas.items || []).filter(it => it.windows.length).map(it => quotaCard(it))));
   const k = d.kanban[0];
   const kanbanMini = k ? card('Kartlar · ' + k.board, '', h('div', { class: 'grid g-kpi' },
-    ['running', 'blocked', 'ready', 'todo'].filter(x => k.counts[x] != null).map(x => kpi(STATUS[x][0], nfi.format(k.counts[x]))),
+    ['running', 'review', 'blocked', 'ready', 'todo'].filter(x => k.counts[x] != null).map(x => kpi(STATUS_LABEL(x), nfi.format(k.counts[x]), x === 'blocked' ? blockedHint(k) : null)),
     kpi('Bu aralıkta biten', nfi.format(k.done_daily.reduce((a, b) => a + b.done, 0))))) : null;
   const c = d.clis;
   const srcKeys = ['hermes', ...c.sources.map(x => x.source)];
@@ -890,31 +1040,33 @@ function renderOverview(d) {
     values: { hermes: Object.values(x.by).reduce((a, v) => a + v.tokens, 0), ...(c.daily[i]?.tokens || {}) } }));
   const allTok = t.tokens + c.sources.reduce((a, x) => a + x.tokens, 0);
   const allCost = t.cost + c.sources.reduce((a, x) => a + x.cost, 0);
-  const allCard = card('Tüm kaynaklar', `Hermes + CLI ajanları · ${fmtN(allTok)} token · ${fmtUsd(allCost)}`,
+  const allCard = card('Tüm kaynaklar', `Hermes + CLI oturumları · ${fmtN(allTok)} token · ${fmtUsd(allCost)}`,
     [legend(srcSeries), barChart(srcCols, srcSeries)],
     { tableView: () => table([{ label: 'Gün', get: r => r.label }, ...srcSeries.map(se => ({ label: se.label, n: 1, get: r => fmtN(r.values[se.key]) }))], [...srcCols].reverse()) });
   const srcShare = card('Kaynak payı', 'token', shareBar([{ label: 'Hermes', value: t.tokens, color: srcColor('hermes') }, ...c.sources.map(x => ({ label: x.name, value: x.tokens, color: srcColor(x.source) }))]));
-  return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, allCard, srcShare), h('div', { class: 'grid g2' }, dailyUsageCard(u), dailyUsageCard(u, 'cost')),
+  return h('div', { class: 'stack' }, h('div', { id: 'ov-open' }, lastLive ? openJobsCard(lastLive) : null), kpis, h('div', { class: 'grid g2' }, allCard, srcShare), h('div', { class: 'grid g2' }, dailyUsageCard(u), dailyUsageCard(u, 'cost')),
     h('div', { class: 'grid g2' }, share, quotas), h('div', { class: 'grid g2' }, models, agents), kanbanMini);
 }
 
 function renderAccounts(d) {
+  noteQuotaItems(d.quotas.items);
   const u = usageFor(d.usage);
-  d = { ...d, quotas: { ...d.quotas, items: (d.quotas.items || []).filter(it => fIs('provider', it.provider)) },
-        history: d.history.filter(x => fIs('provider', x.provider)) };
+  d = { ...d, quotas: { ...d.quotas, items: (d.quotas.items || []).filter(it => fIs('provider', pBase(it.provider))) },
+        history: d.history.filter(x => fIs('provider', pBase(x.provider))) };
   const quotaGrid = h('div', { class: 'grid g3' }, (d.quotas.items || []).map(it => quotaCard(it)));
   const refresh = h('button', { class: 'ctl', onclick: async ev => { ev.target.textContent = 'çekiliyor…'; const x = await api('accounts', '&force=1'); $('p-accounts').replaceChildren(renderAccounts(x)); } }, 'Kotaları şimdi çek');
-  const accountsFor = p => ((d.quotas.items || []).find(it => it.provider === p)?.accounts || []).map(a => a.label || a.source).join(', ') || '—';
-  const usageTable = card('Hesap bazında kullanım', 'seçili aralıkta', table([
+  // the quota item is "anthropic#<account>", the usage row plain "anthropic": match on the provider, join every account's credentials
+  const accountsFor = p => (d.quotas.items || []).filter(it => pBase(it.provider) === p).flatMap(it => it.accounts).map(a => a.label || a.source).join(', ') || '—';
+  const usageTable = card('Sağlayıcı bazında kullanım', 'seçili aralıkta', table([
     { label: 'Sağlayıcı', get: r => h('span', {}, h('i', { style: `display:inline-block;width:9px;height:9px;border-radius:2px;margin-right:7px;background:${pColor(r.provider)}` }), pName(r.provider)) },
-    { label: 'Hesap', get: r => accountsFor(r.provider) },
+    { label: 'Kimlik bilgileri', get: r => accountsFor(r.provider) },
     { label: 'Girdi', n: 1, get: r => fmtN(r.input) }, { label: 'Çıktı', n: 1, get: r => fmtN(r.output) },
     { label: 'Önbellek', n: 1, get: r => fmtN(r.cache_read) }, { label: 'API çağrısı', n: 1, get: r => fmtN(r.calls) },
     { label: 'Oturum', n: 1, get: r => nfi.format(r.sessions) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
     { label: 'Faturalama', get: r => r.mode === 'subscription_included' ? 'abonelik' : r.mode ? 'OAuth / API' : '—' },
   ], u.by_provider));
   const hist = d.history.filter(x => x.points.length);
-  const hs = hist.map((x, i) => ({ label: `${pName(x.provider)} · ${x.window}`, color: ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)'][i % 5], points: x.points }));
+  const hs = hist.map((x, i) => ({ label: `${pName(x.provider)} · ${winName(x.window)}`, color: ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)'][i % 5], points: x.points }));
   const histCard = card('Kota geçmişi', 'kullanım yüzdesi · panel 5 dk\'da bir kaydeder',
     hs.length ? [legend(hs, 'line'), lineChart(hs)] : h('div', { class: 'empty' }, 'Henüz kayıt yok. Panel açık kaldıkça kota geçmişi burada birikir.'),
     { tableView: () => table([{ label: 'Pencere', get: r => r.label }, { label: 'Son değer', n: 1, get: r => fmtPct(r.points.at(-1)?.[1]) }, { label: 'Ölçüm', n: 1, get: r => r.points.length }], hs) });
@@ -933,16 +1085,16 @@ function renderAgents(d) {
   fOptions('status', ['running', 'idle'], STATUS_LABEL);
   const all = d.agents.filter(a => !state.profile || a.name === state.profile);
   const list = all.filter(a => fIs('provider', a.provider) && fIs('status', a.active ? 'running' : 'idle') && fMatch(a.name, a.model, a.last_title));
-  fCount(list.length, all.length, 'ajan');
+  fCount(list.length, all.length, 'profil');
   const active = list.filter(a => a.active).length;
   const kpis = h('div', { class: 'grid g-kpi' },
-    kpi('Ajan', String(list.length), `${active} tanesi şu an çalışıyor`),
+    kpi('Profil', String(list.length), `${active} tanesinde açık oturum var`),
     kpi('Oturum', nfi.format(list.reduce((a, x) => a + x.sessions, 0))),
     kpi('Token', fmtN(list.reduce((a, x) => a + x.tokens, 0))),
     kpi('Maliyet', fmtUsd(list.reduce((a, x) => a + x.cost, 0)), 'tahmini'),
     kpi('Araç çağrısı', fmtN(list.reduce((a, x) => a + x.tool_calls, 0))));
-  const tbl = card('Ajanlar', 'seçili aralıkta', table([
-    { label: 'Ajan', get: r => h('div', {}, h('b', {}, r.name), r.error ? h('div', { class: 'err' }, r.error) : null) },
+  const tbl = card('Profiller', 'seçili aralıkta', table([
+    { label: 'Profil', get: r => h('div', {}, h('b', {}, r.name), r.error ? h('div', { class: 'err' }, r.error) : null) },
     { label: 'Durum', get: r => statusEl(r.active ? 'running' : 'idle') },
     { label: 'Model', get: r => h('div', {}, r.model || '—', h('div', { class: 'sub', style: 'font-size:11.5px' }, pName(r.provider || ''))) },
     { label: 'Günlük', get: r => sparkline(days.map(x => r.daily[x] || 0), pColor(r.provider)) },
@@ -975,11 +1127,11 @@ function renderSubagents(d) {
   const dayCard = card('Günlük alt ajan sayısı', '', barChart(d.days.map(x => ({ label: dayLabel(x), values: { v: perDay[x] } })), [{ key: 'v', label: 'Alt ajan', color: 'var(--s1)' }], { height: 150, fmt: v => nfi.format(Math.round(v)) }));
   const byProf = {};
   list.forEach(x => byProf[x.profile] = (byProf[x.profile] || 0) + 1);
-  const profCard = card('Ajana göre', 'alt ajan sayısı', hBars(Object.entries(byProf).map(([k, v]) => ({ label: k, value: v })), { fmt: v => nfi.format(v) }));
+  const profCard = card('Profile göre', 'alt ajan sayısı', hBars(Object.entries(byProf).map(([k, v]) => ({ label: k, value: v })), { fmt: v => nfi.format(v) }));
   const tbl = card('Alt ajanlar', `en yeni ${list.length}`, table([
     { label: 'Durum', get: r => statusEl(r.status) },
     { label: 'Görev', get: r => h('div', { style: 'max-width:380px' }, r.title || '(başlıksız)', h('div', { class: 'sub', style: 'font-size:11.5px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap' }, r.parent ? '↰ ' + r.parent : '')) },
-    { label: 'Ajan', get: r => r.profile }, { label: 'Model', get: r => r.model || '—' },
+    { label: 'Profil', get: r => r.profile }, { label: 'Model', get: r => r.model || '—' },
     { label: 'Süre', n: 1, get: r => dur(r.duration) }, { label: 'Token', n: 1, get: r => fmtN(r.tokens) },
     { label: 'Araç', n: 1, get: r => nfi.format(r.tools) }, { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost) },
     { label: 'Başladı', get: r => ago(r.started) },
@@ -1041,11 +1193,12 @@ function renderClis(d0) {
     { label: 'Maliyet', n: 1, get: r => fmtUsd(r.cost + (byParent[r.id] || []).reduce((a, x) => a + x.cost, 0)) },
     { label: 'Son', get: r => ago(r.last) },
   ], mains));
-  const note = h('div', { class: 'note' }, 'Claude Code, Hermes ile aynı Anthropic hesabının kotasını kullanır; kota durumu "Hesaplar & Kotalar" sayfasında. Token = girdi + çıktı (önbellekten okunan ayrı gösterilir). Gemini / Antigravity ve Factory Droid kullanım kaydı tutmadığı için sadece son hareket gösterilir.');
+  const note = h('div', { class: 'note' }, 'Claude Code oturumları da bir Anthropic kotasından yer; hangi hesaba bağlı olduğu ve kota durumu "Hesaplar & Kotalar" sayfasında (Claude Code girişi tek hesap olarak görünür). Token = girdi + çıktı (önbellekten okunan ayrı gösterilir). Gemini / Antigravity ve Factory Droid kullanım kaydı tutmadığı için sadece son hareket gösterilir.');
   return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, dayCard, costCard), h('div', { class: 'grid g2' }, models, projCard), tbl, note);
 }
 
-const KORDER = ['running', 'blocked', 'ready', 'todo', 'triage', 'done'];
+const KORDER = ['running', 'review', 'blocked', 'ready', 'scheduled', 'todo', 'triage', 'done'];
+const blockedHint = b => b.blocked_by_kind ? `${b.blocked_by_kind.needs_input || 0} girdi bekliyor · ${b.blocked_by_kind.other || 0} diğer` : null;
 function renderKanban(d) {
   if (!d.boards.length) return h('div', { class: 'card empty' }, 'Kart yok.');
   return h('div', { class: 'stack' }, d.boards.map(b => {
@@ -1056,19 +1209,22 @@ function renderKanban(d) {
     fCount(cards.length, scoped.length, 'kart');
     const doneInRange = b.done_daily.reduce((a, x) => a + x.done, 0);
     const kpis = h('div', { class: 'grid g-kpi' },
-      KORDER.filter(x => x !== 'done' && b.counts[x] != null).map(x => kpi(STATUS[x][0], nfi.format(b.counts[x]))),
+      KORDER.filter(x => x !== 'done' && b.counts[x] != null).map(x => kpi(STATUS_LABEL(x), nfi.format(b.counts[x]), x === 'blocked' ? blockedHint(b) : null)),
       kpi('Bu aralıkta biten', nfi.format(doneInRange)), kpi('Toplam', nfi.format(Object.values(b.counts).reduce((a, x) => a + x, 0)), `${b.counts.archived || 0} arşivde`));
     const doneCard = card('Günlük biten kart', '', barChart(b.done_daily.map(x => ({ label: dayLabel(x.day), values: { v: x.done } })), [{ key: 'v', label: 'Biten', color: 'var(--s3)' }], { height: 150, fmt: v => nfi.format(Math.round(v)) }));
     const aSeries = [{ key: 'done', label: 'Biten (aralıkta)', color: 'var(--s1)' }, { key: 'running', label: 'Çalışan', color: 'var(--s2)' }, { key: 'blocked', label: 'Bloklu', color: 'var(--s4)' }];
-    const aCard = card('Ajana göre kartlar', '', table([{ label: 'Ajan', get: r => r.assignee }, ...aSeries.map(se => ({ label: se.label, n: 1, get: r => nfi.format(r[se.key] || 0) })),
+    const aCard = card('Atanan profile göre kartlar', '', table([{ label: 'Profil', get: r => r.assignee }, ...aSeries.map(se => ({ label: se.label, n: 1, get: r => nfi.format(r[se.key] || 0) })),
       { label: 'Diğer', n: 1, get: r => nfi.format(Object.entries(r).filter(([k]) => !['assignee', 'done', 'running', 'blocked'].includes(k)).reduce((a, [, v]) => a + v, 0)) }], assignees));
     const statuses = [...new Set([...KORDER.filter(x => cards.some(c => c.status === x)), ...cards.map(c => c.status)])];
     const cols = h('div', { class: 'cols' }, statuses.map(st => {
       const cs = cards.filter(c => c.status === st);
       return h('div', { class: 'col' }, h('h4', {}, statusEl(st), h('span', { class: 'sub' }, st === 'done' ? `${cs.length} (aralıkta)` : String(b.counts[st] ?? cs.length))),
-        cs.slice(0, st === 'done' ? 12 : 40).map(c => h('div', { class: 'kcard' }, c.title,
+        cs.slice(0, st === 'done' ? 12 : 40).map(c => openable(h('div', { class: 'kcard' }, c.title,
           h('div', { class: 'sub' }, `${c.assignee || 'atanmamış'} · ${ago(c.completed_at || c.last_heartbeat_at || c.started_at || c.created_at)}`),
-          c.consecutive_failures ? h('div', { class: 'err' }, `${c.consecutive_failures} hata: ${(c.last_failure_error || '').slice(0, 120)}`) : null)));
+          c.block_kind === 'needs_input' || c.status === 'review' || canOpen(c.open) ? h('div', { class: 'chips' },
+            c.block_kind === 'needs_input' ? h('span', { class: 'chip' }, 'girdi bekliyor') : null,
+            c.status === 'review' ? h('span', { class: 'chip' }, 'inceleme bekliyor') : null, openHint(c.open)) : null,
+          c.consecutive_failures ? h('div', { class: 'err' }, `${c.consecutive_failures} hata: ${(c.last_failure_error || '').slice(0, 120)}`) : null), c.open)));
     }));
     return h('div', { class: 'stack' }, kpis, h('div', { class: 'grid g2' }, doneCard, aCard), card('Pano · ' + b.board, '', cols));
   }));
