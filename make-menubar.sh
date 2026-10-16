@@ -50,6 +50,7 @@ else
   <key>CFBundleIconFile</key><string>AgentMonitor</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>LSUIElement</key><true/>
+  <key>NSAppleEventsUsageDescription</key><string>Agent Bar brings the Terminal / iTerm tab of an open session to the front.</string>
   <key>NSAppTransportSecurity</key><dict><key>NSAllowsLocalNetworking</key><true/></dict>
 </dict></plist>
 PL

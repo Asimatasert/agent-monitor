@@ -76,24 +76,48 @@ Top level: `counts` (**new**) — one counting rule for every surface (main sess
 {"kind": "hermes-session" | "kanban-card" | "claude-code" | "copilot-cli" | "none",
  "url": "<string>" | null,
  "command": "<string>" | null,
- "label": "<string>"}
+ "label": "<string>",
+ "running": true | false,          // a process of this session is alive (its pid is known)
+ "pid": <int> | null, "tty": "ttys004" | null,
+ "app": "/Applications/Hermes.app" | null, "app_pid": <int> | null,
+ "background": true | false,       // lives in Claude Code's background host (no window of its own)
+ "attach": "claude attach <id>" | null}
 ```
 
-`url` is set only for a URL scheme that was verified (below); otherwise `command` is the fallback. A client opens `url`
-when present (`NSWorkspace.open`), else **copies** `command` to the clipboard and tells the user — a command is never
-run automatically. `label` is the session/card title (or its id), language-neutral. `kind: "none"` → the row is not
-clickable (no cursor/chevron).
+`url` is set only for a URL scheme that was verified (below); otherwise `command` is the fallback. `label` is the
+session/card title (or its id), language-neutral. `kind: "none"` → the row is not clickable (no cursor/chevron).
+
+**Process facts** (`running` … `attach`, always present, `null`/`false` when unknown) tell a client *where the session
+is on screen*, so a click can bring it forward instead of starting a second process on it:
+
+* `pid` is the process behind the session: the Hermes lease pid (desktop sessions: Hermes.app's python child; CLI/TUI:
+  the `hermes` process; kanban: the worker), or Claude Code's registry pid. A subagent carries its parent's.
+* `tty` is that process's controlling terminal (`ps`); `null` for headless processes and desktop sessions.
+* `app` / `app_pid` is the nearest ancestor process that lives inside an `.app` bundle (`Terminal.app`, `iTerm.app`,
+  `Hermes.app`, an editor…). `null` when none (a shell started by launchd, a background pty host).
+* `background` is true for a process under Claude Code's `bg-pty-host`/daemon; `attach` is then
+  `claude attach <job id>` — shows the *running* session in a terminal without starting another one.
+
+**How the clients use it** (Agent Bar: `Opener.plan` in `menubar/AgentBar.swift`; web: `openAction` in `index.html`):
+
+1. `running` with a `tty` and not `background` → bring that terminal tab/window to the front (Agent Bar only);
+2. `url` (kanban rows: `session_url`) → open it;
+3. `running` and `attach` → `claude attach …` in a new Terminal window;
+4. `running`, nothing reachable → copy the command and say why (a second resume would write to the same session);
+5. not running → resume in a new Terminal window (Hermes, Claude Code; only `hermes [-p p] --resume <id>` and
+   `[cd <dir> && ]claude (--resume|attach) <id>` are ever run); Copilot CLI and the web panel copy the command.
 
 | `open.kind` | Row | `url` | `command` |
 |---|---|---|---|
-| `hermes-session` | Hermes session (desktop/cli/tui/messaging/…) and subagents (opens the **parent**) | `hermes://open/<session id>` for `origin == "desktop"` when `/Applications/Hermes.app` (or `~/Applications`) exists, else `null` | `hermes -p <profile> --resume <id>` (`-p` omitted for `default`) |
+| `hermes-session` | Hermes session (any origin/profile) and subagents (opens the **parent**) | `hermes://open/<session id>` when `/Applications/Hermes.app` (or `~/Applications`) exists, else `null` | `hermes -p <profile> --resume <id>` (`-p` omitted for `default`) |
 | `kanban-card` | kanban worker row, card-only row, and every card in `/api/kanban` | `hermes://open/kanban` (the board page) when Hermes.app exists | `hermes kanban [--board <slug>] show <card id>` |
 | `claude-code` | Claude Code session (subagents → parent session) | `null` | `cd '<project>' && claude --resume '<id>'` |
 | `copilot-cli` | Copilot CLI session | `null` | `copilot --resume '<id>'` |
 | `none` | anything else | `null` | `null` |
 
-Extra keys on `kanban-card`: `card_id`; and `session_command` (the `hermes -p … --resume …` command of the worker
-session) when the row has a worker session.
+Extra keys on `kanban-card`: `card_id`; and, when the row has a worker session, `session_command` (the
+`hermes -p … --resume …` command of that session) and `session_url` (`hermes://open/<worker session id>`). A row with
+`session_command` opens the **session**; a card without one (card-only row, `/api/kanban` cards) opens the board.
 
 ### What was verified, and what was not
 
@@ -101,12 +125,14 @@ session) when the row has a worker session.
   an option of `kanban` itself, so it goes **before** the verb (`hermes kanban --board work show t_…`; after the verb
   it is a usage error — checked by running it).
 * `claude --help` lists `--resume`; Claude Code finds a session under the current directory's project, hence the `cd`.
+  `claude attach <id|name>` ("Open the background session in this terminal … The session keeps running") is what
+  `attach` uses; `jobId` in `~/.claude/sessions/<pid>.json` is the short id it takes.
 * `copilot` is not installed on this machine: `copilot --resume <id>` could not be checked.
-* `hermes://open/<id>`: **read in Hermes' source, not run** (Hermes `b4649c449f`): `Info.plist` registers the `hermes`
-  scheme; `apps/desktop/src/lib/hermes-open-target.ts` maps `hermes://open/<path>` to the in-app route `/<path>`;
-  `apps/desktop/src/app/routes.ts` makes a single-segment route a chat (`/<session id>`). The URL carries no
-  profile, so whether the desktop opens another profile's session was not verified. That is why a URL is offered only
-  for `origin == "desktop"` and `command` is always present as the fallback. Please try one for real before relying on it.
+* `hermes://open/<id>` **was run for real** against the running Hermes.app (0.21.7): a desktop session of another
+  profile (`lead`), a CLI session (`developer`) and a kanban worker session each opened as the active chat — so the URL
+  is now offered for every origin and profile, not only `desktop`. Whether Hermes.app opens a session that a *terminal*
+  Hermes process is writing to as a safe read-only view was not checked, which is why clients prefer bringing the
+  terminal window forward when there is one.
 * Hermes has **no per-card route** (the open card is component state in `board.tsx`): the card's `url` opens the board,
   `command` prints the card. Clients should copy the card id/command and say so.
 

@@ -54,10 +54,19 @@ struct LiveCounts: Decodable {
 struct OpenAction: Decodable {
     let kind: String            // hermes-session | kanban-card | claude-code | copilot-cli | none
     let url: String?            // set only for a scheme the server verified
-    let command: String?        // fallback: copied to the clipboard, never run
+    let command: String?        // fallback: run in a new Terminal window (resume/attach) or copied, see Opener.plan
     let label: String?
     let cardId: String?
     let sessionCommand: String? // kanban rows: the worker session's resume command
+    var sessionUrl: String? = nil   // kanban rows: hermes://open/<worker session id>
+    // process facts of the session behind the row (server: docs/api-live.md, `process_info`)
+    var running: Bool? = nil    // a process of this session is alive
+    var pid: Int? = nil
+    var tty: String? = nil      // e.g. "ttys004" — the terminal tab that holds it
+    var app: String? = nil      // .app bundle that hosts the process (Terminal, iTerm, Hermes…)
+    var appPid: Int? = nil
+    var background: Bool? = nil // lives in Claude Code's background host: no window of its own
+    var attach: String? = nil   // `claude attach <id>`: shows a background session in a terminal
     var canOpen: Bool { kind != "none" && (url != nil || command != nil) }
 }
 
@@ -772,45 +781,288 @@ let OPEN_SCHEMES: Set<String> = ["hermes", "http", "https"]
 extension OpenAction {
     /// Notification payload (property-list types only).
     var userInfo: [String: String] {
-        ["kind": kind, "url": url ?? "", "command": command ?? "", "label": label ?? "", "cardId": cardId ?? "", "sessionCommand": sessionCommand ?? ""]
+        ["kind": kind, "url": url ?? "", "command": command ?? "", "label": label ?? "", "cardId": cardId ?? "",
+         "sessionCommand": sessionCommand ?? "", "sessionUrl": sessionUrl ?? "", "running": running == true ? "1" : "",
+         "pid": pid.map(String.init) ?? "", "tty": tty ?? "", "app": app ?? "", "appPid": appPid.map(String.init) ?? "",
+         "background": background == true ? "1" : "", "attach": attach ?? ""]
     }
     init?(userInfo i: [AnyHashable: Any]) {
         guard let kind = i["kind"] as? String, !kind.isEmpty else { return nil }
         func opt(_ k: String) -> String? { (i[k] as? String).flatMap { $0.isEmpty ? nil : $0 } }
         self.init(kind: kind, url: opt("url"), command: opt("command"), label: opt("label"), cardId: opt("cardId"), sessionCommand: opt("sessionCommand"))
+        sessionUrl = opt("sessionUrl")
+        running = opt("running") == "1" ? true : nil
+        pid = opt("pid").flatMap { Int($0) }
+        tty = opt("tty")
+        app = opt("app")
+        appPid = opt("appPid").flatMap { Int($0) }
+        background = opt("background") == "1" ? true : nil
+        attach = opt("attach")
     }
+
+    /// What a click does (the one decision; see `Opener.plan`).
+    var step: OpenStep { Opener.plan(self) }
+    /// Row glyph that says what the click does.
+    var icon: String {
+        switch step {
+        case .url, .board: return "arrow.up.forward.square"
+        case .focus: return "macwindow"
+        case .terminal: return "terminal"
+        case .copy, .nothing: return "doc.on.doc"
+        }
+    }
+    var clickHint: String {
+        switch step {
+        case .url: return L("Click to open", "Tıkla: aç")
+        case .board: return L("Click: opens the Hermes board and copies the card command (Hermes has no per-card link)",
+                              "Tıkla: Hermes panosunu açar, kart komutunu kopyalar (Hermes'te karta özel bağlantı yok)")
+        case .focus: return L("Click to bring its window to the front", "Tıkla: penceresini öne getir")
+        case .terminal(_, let attach):
+            return attach ? L("Click to show it in a new Terminal window", "Tıkla: yeni Terminal penceresinde göster")
+                          : L("Click to resume it in a new Terminal window", "Tıkla: yeni Terminal penceresinde devam ettir")
+        case .copy(_, let running):
+            return running ? L("Click to copy the command (it is running elsewhere: not resumed twice)", "Tıkla: komutu kopyala (başka yerde çalışıyor: ikinci kez devam ettirilmez)")
+                           : L("Click to copy the resume command", "Tıkla: devam komutunu kopyala")
+        case .nothing: return ""
+        }
+    }
+}
+
+/// What a click on a session / card does. Decided by `Opener.plan` (pure), carried out by `Opener.open`.
+enum OpenStep: Equatable {
+    case nothing
+    case board(url: URL, copy: String?)                    // kanban card: Hermes has no card route → board + card command
+    case url(URL)                                          // hermes://open/<session>, http(s)
+    case focus(tty: String, app: String?, appPid: Int?)    // a terminal tab / app window already holds the session
+    case terminal(command: String, attach: Bool)           // new Terminal window: `claude attach` or a resume
+    case copy(String, running: Bool)                       // fall back: copy the command (running: why it is not run)
+
+    var copies: Bool { if case .copy = self { return true }; return false }
 }
 
 @MainActor
 enum Opener {
     enum Source { case row, notification }
 
-    /// url -> NSWorkspace.open; no url (or nothing handles it) -> copy the command and tell the user.
-    /// A command is never run for the user: it may hold a project path / id from the data, and running shell text
-    /// without a click on "Run" is the wrong default (it also would need Automation permission for Terminal).
-    /// Kanban cards: Hermes has no per-card route, so the board opens AND the card command is copied.
+    // ---- the decision (pure, unit-testable) ----
+
+    nonisolated static func systemHandles(_ url: URL) -> Bool { NSWorkspace.shared.urlForApplication(toOpen: url) != nil }
+
+    nonisolated static func validURL(_ s: String?) -> URL? {
+        s.flatMap(URL.init(string:)).flatMap { OPEN_SCHEMES.contains($0.scheme?.lowercased() ?? "") ? $0 : nil }
+    }
+
+    nonisolated static func validTTY(_ t: String) -> Bool { t.range(of: #"^ttys\d{1,4}$"#, options: .regularExpression) != nil }
+
+    /// Only these shapes are ever run in a Terminal window (the text comes from session data): a resume or attach of
+    /// one session, optionally after `cd <project>`. Anything else is copied, never run.
+    nonisolated static func runnable(_ c: String) -> Bool {
+        let tok = #"'?[A-Za-z0-9_.:-]+'?"#
+        let path = #"(?:'[^'\n]+'|[A-Za-z0-9_./@+-]+)"#
+        let shapes = [#"^(?:cd \#(path) && )?claude (?:--resume|attach) \#(tok)$"#,
+                      #"^hermes(?: -p \#(tok))? --resume \#(tok)$"#]
+        return !c.contains("\n") && shapes.contains { c.range(of: $0, options: .regularExpression) != nil }
+    }
+
+    /// Order of preference — and why:
+    ///  1. a terminal tab / app window already holds the live session → bring it to the front (never start a second
+    ///     process on a session that is running: two writers on one transcript);
+    ///  2. a URL the system can handle (hermes://open/<id> opens any Hermes session in Hermes.app, tried for real);
+    ///  3. a background Claude Code session (no window): `claude attach` in a new Terminal window (does not start a
+    ///     second process — the session keeps running);
+    ///  4. running somewhere we cannot reach → copy the command and say why;
+    ///  5. not running: resume in a new Terminal window (Hermes / Claude Code); Copilot CLI keeps copying.
+    nonisolated static func plan(_ a: OpenAction?, handles: (URL) -> Bool = Opener.systemHandles) -> OpenStep {
+        guard let a, a.canOpen else { return .nothing }
+        let isCard = a.kind == "kanban-card"
+        if isCard && a.sessionCommand == nil {  // a card without a worker session: the board is all Hermes can show
+            if let u = validURL(a.url), handles(u) { return .board(url: u, copy: a.command) }
+            return a.command.map { .copy($0, running: false) } ?? .nothing
+        }
+        let resume = isCard ? a.sessionCommand : a.command
+        if a.running == true, a.background != true, let tty = a.tty, validTTY(tty) {
+            return .focus(tty: tty, app: a.app, appPid: a.appPid)
+        }
+        if let u = validURL(isCard ? a.sessionUrl : a.url), handles(u) { return .url(u) }
+        if a.running == true, let at = a.attach, runnable(at) { return .terminal(command: at, attach: true) }
+        guard let cmd = resume ?? a.attach else { return .nothing }
+        if a.running == true { return .copy(cmd, running: true) }
+        if a.kind != "copilot-cli", runnable(cmd) { return .terminal(command: cmd, attach: false) }
+        return .copy(cmd, running: false)
+    }
+
+    // ---- carrying it out ----
+
     static func open(_ a: OpenAction?, source: Source = .row) {
-        guard let a, a.canOpen else { say(L("Nothing to open for this row", "Bu satır için açılacak bir yer yok"), source); return }
-        let url = a.url.flatMap(URL.init(string:)).flatMap { OPEN_SCHEMES.contains($0.scheme?.lowercased() ?? "") ? $0 : nil }
-        let handled = url.map { NSWorkspace.shared.urlForApplication(toOpen: $0) != nil } ?? false
-        let name = a.label ?? a.cardId ?? ""
-        if a.kind == "kanban-card" {
-            let copied = a.command.map(copy) ?? false
-            if handled, let url {
-                NSWorkspace.shared.open(url)
-                say(L("No per-card link in Hermes: board opened", "Karta özel bağlantı yok: Hermes panosu açıldı")
-                    + (copied ? L(", card command copied: \(a.command ?? "")", ", kart komutu kopyalandı: \(a.command ?? "")") : ""), source)
-            } else if copied, let c = a.command {
-                say(L("Command copied — run it in Terminal: \(c)", "Komut kopyalandı — Terminal'de çalıştır: \(c)"), source)
+        let name = a?.label ?? a?.cardId ?? ""
+        switch plan(a) {
+        case .nothing:
+            say(L("Nothing to open for this row", "Bu satır için açılacak bir yer yok"), source)
+        case .board(let url, let cmd):
+            let copied = cmd.map(copy) ?? false
+            NSWorkspace.shared.open(url)
+            say(L("No per-card link in Hermes: board opened", "Karta özel bağlantı yok: Hermes panosu açıldı")
+                + (copied ? L(", card command copied: \(cmd ?? "")", ", kart komutu kopyalandı: \(cmd ?? "")") : ""), source)
+        case .url(let url):
+            NSWorkspace.shared.open(url)
+            if a?.kind == "kanban-card", let id = a?.cardId {
+                say(L("Opening the worker session of card \(id)", "\(id) kartının işçi oturumu açılıyor"), source)
+            } else {
+                say(L("Opening: \(name)", "Açılıyor: \(name)"), source)
             }
+        case .focus(let tty, let app, let appPid):
+            focus(tty: tty, app: app, appPid: appPid) { result in
+                switch result {
+                case .tab(let who): say(L("Brought to the front (\(who), \(tty)): \(name)", "Öne getirildi (\(who), \(tty)): \(name)"), source)
+                case .appOnly(let who, let why):
+                    say(L("\(who) brought forward, but its tab could not be picked (\(why)). Session: \(name)",
+                          "\(who) öne getirildi ama sekme seçilemedi (\(why)). Oturum: \(name)"), source)
+                case .failed:
+                    let cmd = (a?.kind == "kanban-card" ? a?.sessionCommand : a?.command) ?? ""
+                    if !cmd.isEmpty { copy(cmd) }
+                    say(L("Could not find its window; it is running, so it is not resumed twice. Command copied: \(cmd)",
+                          "Penceresi bulunamadı; çalışıyor, bu yüzden ikinci kez devam ettirilmedi. Komut kopyalandı: \(cmd)"), source)
+                }
+            }
+        case .terminal(let cmd, let attach):
+            runInTerminal(cmd) { ok in
+                if ok {
+                    say(attach ? L("Shown in a new Terminal window (the session keeps running): \(name)", "Yeni Terminal penceresinde gösterildi (oturum çalışmaya devam ediyor): \(name)")
+                               : L("Resumed in a new Terminal window: \(name)", "Yeni Terminal penceresinde devam ettirildi: \(name)"), source)
+                } else {
+                    copy(cmd)
+                    say(L("Could not open Terminal. Command copied: \(cmd)", "Terminal açılamadı. Komut kopyalandı: \(cmd)"), source)
+                }
+            }
+        case .copy(let cmd, let running):
+            copy(cmd)
+            say(running ? L("Running in another process that cannot be brought forward — resuming would write to it twice. Command copied: \(cmd)",
+                            "Başka bir süreçte çalışıyor, öne getirilemedi — devam ettirmek iki süreci aynı oturuma yazdırır. Komut kopyalandı: \(cmd)")
+                        : L("Command copied — run it in Terminal: \(cmd)", "Komut kopyalandı — Terminal'de çalıştır: \(cmd)"), source)
+        }
+    }
+
+    enum FocusResult { case tab(String), appOnly(String, String), failed }
+
+    /// Terminal / iTerm: select the tab whose tty it is (AppleScript through `osascript`, so a slow permission prompt
+    /// never freezes the island). If macOS has not allowed Automation (or the tab is not found) the app is still
+    /// brought forward. Any other host app (VS Code, Hermes…): the app is brought forward.
+    static func focus(tty: String, app: String?, appPid: Int?, done: @escaping @MainActor (FocusResult) -> Void) {
+        let apps = NSWorkspace.shared.runningApplications
+        func running(_ id: String) -> NSRunningApplication? { apps.first { $0.bundleIdentifier == id } }
+        let path = app ?? ""
+        let kind: String? = path.hasSuffix("/Terminal.app") ? "terminal" : path.contains("iTerm") ? "iterm"
+            : path.isEmpty ? (running("com.googlecode.iterm2") != nil ? "iterm" : running("com.apple.Terminal") != nil ? "terminal" : nil) : nil
+        guard let kind else {
+            // some other app hosts the terminal: bring it forward
+            if let p = appPid, let r = NSRunningApplication(processIdentifier: pid_t(p)) {
+                r.activate()
+                if !path.isEmpty { NSWorkspace.shared.open(URL(fileURLWithPath: path)) }
+                done(.appOnly(r.localizedName ?? "App", L("the app has its own tabs", "uygulamanın kendi sekmeleri var")))
+            } else { done(.failed) }
             return
         }
-        if handled, let url {
-            NSWorkspace.shared.open(url)
-            say(L("Opening: \(name)", "Açılıyor: \(name)"), source)
-        } else if let c = a.command {
-            copy(c)
-            say(L("Command copied — run it in Terminal: \(c)", "Komut kopyalandı — Terminal'de çalıştır: \(c)"), source)
+        let name = kind == "iterm" ? "iTerm" : "Terminal"
+        let bundlePath = kind == "iterm" ? (path.isEmpty ? "/Applications/iTerm.app" : path) : "/System/Applications/Utilities/Terminal.app"
+        DispatchQueue.global(qos: .userInitiated).async {
+            let r = selectTab(kind: kind, tty: tty)
+            DispatchQueue.main.async {
+                MainActor.assumeIsolated {
+                    switch r {
+                    case .found: done(.tab(name))
+                    case .notFound, .denied, .error:
+                        NSWorkspace.shared.open(URL(fileURLWithPath: bundlePath))
+                        let why: String
+                        if case .denied = r { why = L("allow Agent Bar to control \(name): System Settings → Privacy & Security → Automation", "Agent Bar'a \(name) denetimi izni ver: Sistem Ayarları → Gizlilik ve Güvenlik → Otomasyon") }
+                        else if case .notFound = r { why = L("no tab with that tty", "bu tty'li sekme yok") }
+                        else { why = L("script error", "betik hatası") }
+                        done(.appOnly(name, why))
+                    }
+                }
+            }
+        }
+    }
+
+    enum TabResult { case found, notFound, denied, error }
+
+    nonisolated static func selectTab(kind: String, tty: String) -> TabResult {
+        let dev = "/dev/" + tty
+        let script: String
+        if kind == "iterm" {
+            script = """
+            on run argv
+              set dev to item 1 of argv
+              tell application "iTerm"
+                repeat with w in windows
+                  repeat with t in tabs of w
+                    repeat with s in sessions of t
+                      if tty of s is dev then
+                        select w
+                        select t
+                        select s
+                        activate
+                        return "ok"
+                      end if
+                    end repeat
+                  end repeat
+                end repeat
+              end tell
+              return "none"
+            end run
+            """
+        } else {
+            script = """
+            on run argv
+              set dev to item 1 of argv
+              tell application "Terminal"
+                repeat with w in windows
+                  repeat with t in tabs of w
+                    if tty of t is dev then
+                      set selected tab of w to t
+                      set index of w to 1
+                      activate
+                      return "ok"
+                    end if
+                  end repeat
+                end repeat
+              end tell
+              return "none"
+            end run
+            """
+        }
+        let p = Process()
+        p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+        p.arguments = ["-e", script, dev]
+        let out = Pipe(), err = Pipe()
+        p.standardOutput = out
+        p.standardError = err
+        do { try p.run() } catch { return .error }
+        let killer = DispatchWorkItem { if p.isRunning { p.terminate() } }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 60, execute: killer)  // a permission prompt may wait for the user
+        p.waitUntilExit()
+        killer.cancel()
+        let o = String(data: out.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        let e = String(data: err.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+        if e.contains("-1743") { return .denied }
+        if p.terminationStatus != 0 { return .error }
+        return o.trimmingCharacters(in: .whitespacesAndNewlines) == "ok" ? .found : .notFound
+    }
+
+    /// A new Terminal window that runs `command` (a temporary .command file; Terminal runs it, no Automation permission
+    /// needed). Only commands accepted by `runnable` get here.
+    static func runInTerminal(_ command: String, done: @escaping @MainActor (Bool) -> Void) {
+        guard runnable(command) else { done(false); return }
+        let dir = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("agent-bar-open", isDirectory: true)
+        let file = dir.appendingPathComponent("open-\(UUID().uuidString.prefix(8)).command")
+        let body = "#!/bin/zsh -il\nrm -f -- \"$0\"\nexport PATH=\"$HOME/.local/bin:$HOME/.hermes/hermes-agent/.hermes/bin:$PATH\"\nclear\n\(command)\n"
+        do {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try body.write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
+        } catch { done(false); return }
+        NSWorkspace.shared.open([file], withApplicationAt: URL(fileURLWithPath: "/System/Applications/Utilities/Terminal.app"),
+                                configuration: NSWorkspace.OpenConfiguration()) { _, err in
+            DispatchQueue.main.async { MainActor.assumeIsolated { done(err == nil) } }
         }
     }
 
@@ -838,7 +1090,7 @@ struct OpenableModifier: ViewModifier {
                 .onTapGesture { Opener.open(a) }
                 .modifier(LinkCursor())
                 .accessibilityAddTraits(.isButton)
-                .accessibilityHint(a.url != nil ? L("Opens it", "Açar") : L("Copies the command", "Komutu kopyalar"))
+                .accessibilityHint(a.clickHint)
         } else {
             content
         }
@@ -883,7 +1135,7 @@ enum Pref {
     static let hoverDelay = "hoverDelay"    // dwell before the notch opens on hover
     static let earWidth = "earWidth"        // width of each ear beside the notch
     static let rightEar = "rightEar"        // sessions | tokens | cost | none
-    static let islandClick = "islandClick"  // panel | web
+    static let islandClick = "islandClick"  // what the hover panel's window icon opens: panel | web (the notch itself opens nothing)
     static let hoverQuotas = "hoverQuotas"
     static let hoverSessions = "hoverSessions"
     static let hoverCost = "hoverCost"
@@ -1660,13 +1912,13 @@ struct ApprovalBanner: View {
                     Text(s.title ?? L("(untitled)", "(başlıksız)")).lineLimit(1).truncationMode(.tail)
                     Spacer(minLength: 4)
                     Text(s.groupName + (s.stateSince.map { " · " + span(now - $0) } ?? "")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
-                    if let o = s.open, o.canOpen { Image(systemName: o.url != nil ? "arrow.up.forward.square" : "doc.on.doc").font(.caption2).foregroundStyle(.orange) }
+                    if let o = s.open, o.canOpen { Image(systemName: o.icon).font(.caption2).foregroundStyle(.orange) }
                 }
                 .font(dense ? .caption : .callout)
                 .padding(.vertical, 3).padding(.horizontal, 6)
                 .background(Color.orange.opacity(0.18), in: RoundedRectangle(cornerRadius: 6))
                 .openable(s.open)
-                .help([s.title, s.open.flatMap { $0.canOpen ? ($0.url != nil ? L("Click to open the session", "Tıkla: oturumu aç") : L("Click to copy the resume command", "Tıkla: devam komutunu kopyala")) : nil }].compactMap { $0 }.joined(separator: "\n"))
+                .help([s.title, s.open.flatMap { $0.canOpen ? $0.clickHint : nil }].compactMap { $0 }.joined(separator: "\n"))
             }
         }
         .padding(8)
@@ -1803,7 +2055,7 @@ struct SessionRow: View {
         .background(s.state == "needs_approval" && s.isRunning ? Color.orange.opacity(0.16) : .clear, in: RoundedRectangle(cornerRadius: 6))
         .openable(s.open)
         .help([s.title, s.kanban?.title.map { L("card: ", "kart: ") + $0 },
-               s.open.flatMap { $0.canOpen ? ($0.url != nil && $0.kind != "kanban-card" ? L("Click to open", "Tıkla: aç") : L("Click: opens the board / copies the command", "Tıkla: panoyu açar / komutu kopyalar")) : nil },
+               s.open.flatMap { $0.canOpen ? $0.clickHint : nil },
                s.activity].compactMap { $0 }.joined(separator: "\n"))
         .contextMenu { SessionActions(id: s.id, source: s.source, profile: s.profile, open: s.open) }
     }
@@ -2244,7 +2496,7 @@ struct SessionActions: View {
 
     var body: some View {
         if let o = open, o.canOpen {
-            Button(o.url != nil ? L("Open", "Aç") : L("Open (copies the command)", "Aç (komutu kopyalar)")) { Opener.open(o) }
+            Button(o.step.copies ? L("Copy the command to open it", "Açmak için komutu kopyala") : L("Open", "Aç")) { Opener.open(o) }
         }
         Button(L("Copy session ID", "Oturum ID'sini kopyala")) { copy(id) }
         Button(L("Copy resume command", "Devam komutunu kopyala")) { copy(resumeCommand) }
@@ -2349,7 +2601,7 @@ struct CardRow: View {
         }
         .font(.callout)
         .openable(card.open)
-        .help(card.open?.canOpen == true ? L("Click: opens the Hermes board and copies the card command (Hermes has no per-card link)", "Tıkla: Hermes panosunu açar, kart komutunu kopyalar (Hermes'te karta özel bağlantı yok)") : "")
+        .help(card.open?.canOpen == true ? (card.open?.clickHint ?? "") : "")
     }
 
     var dot: Color {
@@ -2846,8 +3098,8 @@ final class IslandController {
         p.ignoresMouseEvents = true
         p.acceptsMouseMovedEvents = true
         p.contentView = NSHostingView(rootView: IslandView(store: store, island: .shared, notchW: notch.w, notchH: notch.h,
-                                                           onClick: {
-            if Pref.str(Pref.islandClick) == "web" { openPanel() } else { IslandController.shared.toggleDrop() }
+                                                           onOpenWindow: {
+            IslandController.shared.openWindow()
         }))
         p.orderFrontRegardless()
         island = p
@@ -2884,6 +3136,18 @@ final class IslandController {
     }
 
     func toggleDrop() { drop == nil ? openDrop() : closeDrop() }
+
+    /// The hover panel's "open window" icon (the notch itself opens nothing): the full panel dropped from the notch,
+    /// or the web dashboard — the "Window icon opens" setting.
+    func openWindow() {
+        if Pref.str(Pref.islandClick) == "web" {
+            withAnimation(islandSpring) { Island.shared.hover = false }
+            island?.ignoresMouseEvents = true
+            openPanel()
+        } else {
+            toggleDrop()
+        }
+    }
 
     private func openDrop() {
         guard let store, drop == nil else { return }
@@ -2976,12 +3240,35 @@ struct RingGauge: View {
     }
 }
 
+/// The "open window" icon in the hover panel's top-right corner: the only way (besides a session row) to open
+/// something from the notch.
+struct OpenWindowButton: View {
+    let web: Bool
+    let action: () -> Void
+    @State private var hovered = false
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "arrow.up.forward.app")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.white.opacity(hovered ? 1 : 0.8))
+                .frame(width: 24, height: 22)
+                .background(Color.white.opacity(hovered ? 0.22 : 0.12), in: RoundedRectangle(cornerRadius: 6, style: .continuous))
+                .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onHover { hovered = $0 }
+        .help(web ? L("Open the web dashboard", "Web panelini aç") : L("Open the full panel", "Tam paneli aç"))
+        .accessibilityLabel(web ? L("Open the web dashboard", "Web panelini aç") : L("Open the full panel", "Tam paneli aç"))
+    }
+}
+
 struct IslandView: View {
     @ObservedObject var store: Store
     @ObservedObject var island: Island
     let notchW: CGFloat
     let notchH: CGFloat
-    let onClick: () -> Void
+    let onOpenWindow: () -> Void
+    @AppStorage(Pref.islandClick) private var iconOpens = "panel"
     @AppStorage(Pref.barQuotas) private var quotas = "auto"
     @AppStorage(Pref.lang) private var lang = "en"
     @AppStorage(Pref.islandEars) private var earsSetting = "hover"
@@ -3023,8 +3310,9 @@ struct IslandView: View {
             .frame(width: sz.width, height: island.mode == .hover ? nil : sz.height)
             .contentShape(Rectangle())
             .onTapGesture {
-                // an alert about a session / card: its click opens that, not the generic panel
-                if let o = island.event?.open, o.canOpen { Opener.open(o) } else { onClick() }
+                // Clicking the notch opens no panel. Only an alert about a session / card is clickable: it opens that.
+                // (The full panel opens from the icon in the hover panel's corner.)
+                if let o = island.event?.open, o.canOpen { Opener.open(o) }
             }
             Spacer(minLength: 0)
         }
@@ -3107,6 +3395,13 @@ struct IslandView: View {
     var hoverView: some View {
         let options = store.quotaOptions
         return VStack(alignment: .leading, spacing: 7) {
+            // top row: what a click does, and the "open window" icon in the right corner
+            HStack(spacing: 6) {
+                Text(L("click a row to open it", "satıra tıkla: aç")).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.45))
+                Spacer(minLength: 4)
+                OpenWindowButton(web: iconOpens == "web", action: onOpenWindow)
+            }
+            .padding(.top, -2)
             ForEach(Array((hoverQuotas ? options : []).prefix(4).enumerated()), id: \.offset) { _, o in
                 let used = o.window.used ?? 0
                 HStack(spacing: 8) {
@@ -3143,7 +3438,6 @@ struct IslandView: View {
                     Text(L("API-equiv. today ", "bugün API karşılığı ") + money(store.spend(m, day: isoDay(0))) + L(" (est.)", " (tahmini)")).foregroundStyle(.white.opacity(0.8))
                 }
                 Spacer()
-                Text(L("click a row to open it", "satıra tıkla: aç")).foregroundStyle(.white.opacity(0.45))
             }
             .font(.system(size: 11))
             // an alert that is still on (it takes over the hover): click opens its session / card
@@ -3155,7 +3449,7 @@ struct IslandView: View {
                         Text(e.detail).font(.system(size: 10.5)).foregroundStyle(.white.opacity(0.65)).lineLimit(1)
                     }
                     Spacer(minLength: 4)
-                    Image(systemName: o.url != nil ? "arrow.up.forward.square" : "doc.on.doc").foregroundStyle(.white.opacity(0.6))
+                    Image(systemName: o.icon).foregroundStyle(.white.opacity(0.6))
                 }
                 .padding(.vertical, 4).padding(.horizontal, 8)
                 .background(Color.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 8))
@@ -3426,12 +3720,14 @@ struct SettingsTab: View {
             Toggle(L("Quotas", "Kotalar"), isOn: $hoverQuotas)
             Toggle(L("Running sessions", "Çalışan oturumlar"), isOn: $hoverSessions)
             Toggle(L("Today's API-equivalent (estimate)", "Bugünkü API karşılığı (tahmini)"), isOn: $hoverCost)
-            SegmentRow(title: L("Click opens", "Tıklayınca")) {
+            SegmentRow(title: L("Window icon opens", "Pencere ikonu açar")) {
                 Picker("", selection: $islandClick) {
-                    Text(L("This panel", "Bu panel")).tag("panel")
+                    Text(L("Full panel", "Tam panel")).tag("panel")
                     Text(L("Web dashboard", "Web paneli")).tag("web")
                 }
             }
+            Text(L("Clicking the notch itself opens nothing; the icon in the hover panel's corner does.", "Çentiğe tıklamak bir şey açmaz; üzerine gelince köşede çıkan ikon açar."))
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 

@@ -31,6 +31,7 @@ targets:
         CFBundleName: Agent Bar
         CFBundleIconFile: AgentMonitor
         LSUIElement: true
+        NSAppleEventsUsageDescription: Agent Bar brings the Terminal / iTerm tab of an open session to the front.
         NSAppTransportSecurity: { NSAllowsLocalNetworking: true }
     settings:
       base:

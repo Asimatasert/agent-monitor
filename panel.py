@@ -13,6 +13,7 @@ import re
 import resource
 import shlex
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
@@ -1025,25 +1026,94 @@ def _label(text, fallback):
 
 def open_hermes_session(profile, sid, source, title):
     """Hermes session. `hermes -p <profile> --resume <id>` always works (checked with `hermes --help`).
-    `hermes://open/<id>` is only offered for desktop sessions with Hermes.app installed: the desktop app maps it to its
-    chat route /<id> (apps/desktop: hermes-open-target.ts, routes.ts, read in source, not run). It carries no profile,
-    so for other surfaces and other profiles' CLI sessions the command is the only claim made."""
+    `hermes://open/<id>` was run for real against Hermes.app (a desktop session of another profile, a CLI session, a
+    kanban worker session): the desktop app opened the chat each time, whatever the origin or profile. So the URL is
+    offered for every Hermes session when Hermes.app is installed (`source` is kept for callers and tests)."""
     cmd = "hermes " + (f"-p {shlex.quote(profile)} " if profile and profile != "default" else "") \
           + f"--resume {shlex.quote(sid)}"
-    url = f"hermes://open/{quote(sid, safe='')}" if source == "desktop" and hermes_desktop_installed() else None
+    url = f"hermes://open/{quote(sid, safe='')}" if hermes_desktop_installed() else None
     return {"kind": "hermes-session", "url": url, "command": cmd, "label": _label(title, sid)}
 
 
-def open_kanban_card(card_id, board, title, session_cmd=None):
+# ---------- where does a session live on screen? (process facts for the click) ----------
+
+APP_RE = re.compile(r"^(/.*?\.app)/Contents/")
+_PS = {"t": 0.0, "table": {}}
+
+
+def parse_ps(text):
+    """`ps -axo pid=,ppid=,tty=,command=` -> {pid: (ppid, tty or None, command)}."""
+    table = {}
+    for line in text.splitlines():
+        parts = line.split(None, 3)
+        if len(parts) < 3 or not parts[0].isdigit() or not parts[1].isdigit():
+            continue
+        tty = None if parts[2] in ("??", "?", "-") else parts[2]
+        table[int(parts[0])] = (int(parts[1]), tty, parts[3] if len(parts) > 3 else "")
+    return table
+
+
+def proc_table():
+    """Process list, at most one `ps` per 2 s."""
+    now = time.time()
+    if now - _PS["t"] > 2:
+        try:
+            out = subprocess.run(["ps", "-axo", "pid=,ppid=,tty=,command="], capture_output=True, text=True,
+                                 timeout=5).stdout
+            _PS["table"], _PS["t"] = parse_ps(out), now
+        except (OSError, subprocess.SubprocessError):
+            pass
+    return _PS["table"]
+
+
+def process_info(pid, table=None):
+    """Where a live process shows up: its tty, and the app that hosts it (nearest ancestor inside an `.app` bundle:
+    Terminal, iTerm, Hermes.app...). `background` = it runs inside Claude Code's background pty host (no window).
+    None when the pid is not alive."""
+    table = proc_table() if table is None else table
+    if not pid or pid not in table or not clis.pid_alive(pid):
+        return None
+    info = {"pid": pid, "tty": table[pid][1], "app": None, "app_pid": None, "background": False}
+    cur, hops = pid, 0
+    while cur in table and hops < 25:
+        ppid, _, cmd = table[cur]
+        if "bg-pty-host" in cmd or "--bg-spare" in cmd:
+            info["background"] = True
+        m = APP_RE.match(cmd)
+        if m and info["app"] is None:
+            info["app"], info["app_pid"] = m.group(1), cur
+        if ppid <= 1 or ppid == cur:
+            break
+        cur, hops = ppid, hops + 1
+    return info
+
+
+def with_process(o, pid, attach=None, table=None):
+    """Add the process facts to an `open` object (keys are always present; see docs/api-live.md)."""
+    info = process_info(pid, table) if pid else None
+    o.update({"running": bool(info), "pid": info["pid"] if info else None, "tty": info["tty"] if info else None,
+              "app": info["app"] if info else None, "app_pid": info["app_pid"] if info else None,
+              "background": bool(info and info["background"]), "attach": attach})
+    return o
+
+
+def open_kanban_card(card_id, board, title, session_cmd=None, session_url=None):
     """Kanban card: board page + a command that prints the card (`hermes kanban [--board <b>] show <id>`; --board is a
-    flag of `kanban`, so it goes before the verb)."""
+    flag of `kanban`, so it goes before the verb). A row with a worker session also carries that session
+    (`session_command`, `session_url`): clicking the row opens the session, the card has no route of its own."""
     cmd = "hermes kanban " + (f"--board {shlex.quote(board)} " if board and board != "default" else "") \
           + f"show {shlex.quote(card_id)}"
     out = {"kind": "kanban-card", "url": HERMES_KANBAN_URL if hermes_desktop_installed() else None,
            "command": cmd, "label": _label(title, card_id), "card_id": card_id}
     if session_cmd:
         out["session_command"] = session_cmd
+        out["session_url"] = session_url
     return out
+
+
+def claude_attach_command(sid, job=None):
+    """`claude attach <id>` opens a background (daemon-hosted) session in this terminal; the session keeps running."""
+    return f"claude attach {shlex.quote(job or sid[:8])}"
 
 
 def open_cli_session(kind, sid, project, title):
@@ -1307,24 +1377,36 @@ def model_speed(since):
                    for (src, m), v in rows.items() if v["dur"]), key=lambda x: -x["turns"])
 
 
-def _open_for(r, by_id):
+def _attach_for(row, sid):
+    """`claude attach` command for a Claude Code session hosted in the background (no window of its own)."""
+    return claude_attach_command(sid, row.get("_job")) if row and row.get("_bg") else None
+
+
+def _open_for(r, by_id, table=None):
     """The `open` object of one Live row (contract: docs/api-live.md)."""
     if r.get("kanban"):
         k = r["kanban"]
-        sess = None if r.get("card_only") else open_hermes_session(r["profile"], r["id"], r["origin"], r["title"])
-        return open_kanban_card(k["id"], k["board"], k["title"], sess["command"] if sess else None)
+        card_only = r.get("card_only")
+        sess = None if card_only else open_hermes_session(r["profile"], r["id"], r["origin"], r["title"])
+        o = open_kanban_card(k["id"], k["board"], k["title"], sess and sess["command"], sess and sess["url"])
+        return with_process(o, None if card_only else r.get("_pid"), table=table)
     if r["subagent"]:  # a subagent has no window of its own: open its parent
         parent = by_id.get((r["profile"], r["parent"]))
+        ppid = parent.get("_pid") if parent else None
         if r["kind"] == "hermes" and r.get("_psource"):
-            return open_hermes_session(r["profile"], r["parent"], r["_psource"], r.get("parent_title"))
+            return with_process(open_hermes_session(r["profile"], r["parent"], r["_psource"], r.get("parent_title")),
+                                ppid, table=table)
         if r["kind"] == "claude-code" and r["parent"]:
-            return open_cli_session("claude-code", r["parent"], parent and parent.get("_project") or r.get("_project"),
-                                    parent and parent.get("title"))
+            o = open_cli_session("claude-code", r["parent"], parent and parent.get("_project") or r.get("_project"),
+                                 parent and parent.get("title"))
+            return with_process(o, ppid, _attach_for(parent, r["parent"]), table)
         return dict(NO_OPEN)
     if r["kind"] == "hermes":
-        return open_hermes_session(r["profile"], r["id"], r["origin"], r["title"])
+        return with_process(open_hermes_session(r["profile"], r["id"], r["origin"], r["title"]), r.get("_pid"), table=table)
     if r["kind"] in ("claude-code", "copilot-cli"):
-        return open_cli_session(r["kind"], r["id"], r.get("_project"), r["title"])
+        attach = _attach_for(r, r["id"]) if r["kind"] == "claude-code" else None
+        return with_process(open_cli_session(r["kind"], r["id"], r.get("_project"), r["title"]), r.get("_pid"),
+                            attach, table)
     return dict(NO_OPEN)
 
 
@@ -1410,9 +1492,9 @@ def live():
                            "tools": s["tools"], "messages": s["msgs"],
                            "parent_model": s["pmodel"], "kanban_card": None, "kanban_status": None, "kanban": None,
                            "kind": "hermes", "source_name": "Hermes"}
+                    row["_pid"] = leases.get(s["id"])  # the process behind the lease (dropped before the response)
                     if s["source"] == "kanban" and s["parent"] is None:
-                        # evidence for pairing the worker with its card (dropped before the response)
-                        row["_pid"] = leases.get(s["id"])
+                        # evidence for pairing the worker with its card
                         fu = c.execute("""SELECT content FROM messages WHERE session_id = ? AND role = 'user'
                                           ORDER BY id LIMIT 1""", (s["id"],)).fetchone()
                         row["_first_user"] = (fu[0] or "")[:400] if fu else ""
@@ -1453,6 +1535,7 @@ def live():
                         "started": s["started"], "last": s["last"], "subagent": s["subagent"],
                         "status": "running" if s["running"] else "ended",
                         "end_reason": None if s["running"] else "agent_close", "_project": s["project"],
+                        "_pid": s.get("pid"), "_bg": s.get("background"), "_job": s.get("job"),
                         "long_tool_call": None, "kanban": None, "activity": s["project"],
                         "working": bool(s.get("working")),
                         "origin": s["source"], "interactive": True,
@@ -1482,8 +1565,9 @@ def live():
         if card["status"] == "running" and card["id"] not in taken:
             running.append(card_only_row(card, now))
     by_id = {(r["profile"], r["id"]): r for r in running}
+    table = proc_table()
     for r in running:
-        r["open"] = _open_for(r, by_id)
+        r["open"] = _open_for(r, by_id, table)
         for k in [k for k in r if k.startswith("_")]:
             del r[k]
 

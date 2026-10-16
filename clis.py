@@ -113,7 +113,9 @@ def claude_open_sessions():
         if isinstance(d, dict) and d.get("sessionId") and pid_alive(d.get("pid")):
             since = d.get("statusUpdatedAt")
             out[d["sessionId"]] = {"status": d.get("status"), "waiting_for": d.get("waitingFor"),
-                                   "since": since / 1000 if isinstance(since, (int, float)) else None}
+                                   "since": since / 1000 if isinstance(since, (int, float)) else None,
+                                   # where the process lives: kind "bg" = hosted by Claude Code's daemon (no window)
+                                   "pid": d.get("pid"), "kind": d.get("kind"), "job": d.get("jobId")}
     return out
 
 
@@ -386,6 +388,8 @@ def collect(start, end):
             since = reg.get("since")
         sessions.append({
             "source": "claude-code", "id": sid, "parent": cf.parent if cf.subagent else None,
+            "pid": None if cf.subagent else reg.get("pid"), "background": reg.get("kind") == "bg",
+            "job": reg.get("job"),
             "subagent": cf.subagent, "title": cf.title, "project": cf.cwd,
             "model": evs[-1]["model"] if evs else (cf.events[-1]["model"] if cf.events else None),
             "started": cf.first, "last": max(cf.last or 0, mtime) if now - mtime < RUNNING_WINDOW else cf.last,

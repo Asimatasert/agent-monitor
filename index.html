@@ -305,6 +305,9 @@ const T = {
   copied: cmd => `Komut kopyalandı — Terminal'de çalıştır: ${cmd}`,
   copyFailed: cmd => `Kopyalanamadı. Komut: ${cmd}`,
   cardNoRoute: (copied, cmd) => 'Karta özel bağlantı yok: Hermes panosu açıldı' + (copied ? `, kart komutu kopyalandı: ${cmd}` : ''),
+  openingWorker: id => `${id} kartının işçi oturumu açılıyor`,
+  copiedRunning: cmd => `Bu oturum zaten çalışıyor; tarayıcı pencereyi öne getiremez, ikinci kez devam ettirme. Komut kopyalandı: ${cmd}`,
+  openWorker: 'İşçi oturumunu aç ↗',
   tipOpen: 'Tıkla: aç · Shift+tık: komutu kopyala', tipCopy: 'Tıkla: komutu kopyala',
   noOpen: 'Şu an açık iş yok.',
   approvalTitle: n => `${n} iş onay bekliyor`, approvalHint: 'satıra tıklayınca ilgili oturum açılır',
@@ -327,29 +330,41 @@ async function copyText(t) {
 }
 function launchUrl(u) { const a = h('a', { href: u }); document.body.append(a); a.click(); a.remove(); }
 const canOpen = o => !!o && o.kind !== 'none' && !!(o.url || o.command);
+// A kanban row that has a worker session opens that session (the card itself has no Hermes route); a card without one
+// opens the board. A browser cannot run commands or focus a terminal: url -> open it, otherwise copy.
+const isCardOnly = o => o.kind === 'kanban-card' && !o.session_command;
+const targetUrl = o => o.kind === 'kanban-card' ? (o.session_command ? o.session_url : o.url) : o.url;
+const targetCmd = o => o.kind === 'kanban-card' ? (o.session_command || o.command) : o.command;
 /** One rule for every row (Live, Özet, sidebar, kanban): url -> open it; no url -> copy the command and say so. */
 async function openAction(o, ev) {
   if (!canOpen(o)) { toast(T.nothing); return; }
-  const cmd = o.command;
-  if (o.kind === 'kanban-card') {          // Hermes has no per-card route: open the board AND copy the card command
+  const cmd = targetCmd(o);
+  if (isCardOnly(o)) {                     // Hermes has no per-card route: open the board AND copy the card command
     const copied = cmd ? await copyText(cmd) : false;
     if (o.url) { launchUrl(o.url); toast(T.cardNoRoute(copied, cmd)); } else toast(copied ? T.copied(cmd) : T.copyFailed(cmd));
     return;
   }
-  if (o.url && !(ev && ev.shiftKey && cmd)) { launchUrl(o.url); toast(T.opening(o.label || o.url)); return; }
-  const copied = await copyText(cmd);
-  toast(copied ? T.copied(cmd) : T.copyFailed(cmd));
+  const url = targetUrl(o);
+  if (url && !(ev && ev.shiftKey && cmd)) {
+    launchUrl(url);
+    toast(o.kind === 'kanban-card' && o.card_id ? T.openingWorker(o.card_id) : T.opening(o.label || url));
+    return;
+  }
+  // a running background session is attached (`claude attach`), never resumed a second time
+  const text = o.running && o.attach ? o.attach : cmd;
+  const copied = await copyText(text);
+  toast(copied ? (o.running && !o.attach ? T.copiedRunning(text) : T.copied(text)) : T.copyFailed(text));
 }
 /** Make an element behave as a button that runs openAction (mouse + Enter/Space). */
 function openable(el, o) {
   if (!canOpen(o)) return el;
   el.classList.add('clickable'); el.setAttribute('role', 'button'); el.tabIndex = 0;
-  el.setAttribute('title', (o.label ? o.label + ' — ' : '') + (o.url ? T.tipOpen : T.tipCopy));
+  el.setAttribute('title', (o.label ? o.label + ' — ' : '') + (targetUrl(o) ? T.tipOpen : T.tipCopy));
   el.addEventListener('click', ev => { if (ev.target.closest('a[href], button')) return; ev.preventDefault(); openAction(o, ev); });
   el.addEventListener('keydown', ev => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); openAction(o, ev); } });
   return el;
 }
-const openHint = o => !canOpen(o) ? null : h('span', { class: 'go' }, o.kind === 'kanban-card' ? T.openCard : o.url ? T.open : T.copy);
+const openHint = o => !canOpen(o) ? null : h('span', { class: 'go' }, isCardOnly(o) ? T.openCard : targetUrl(o) ? (o.kind === 'kanban-card' ? T.openWorker : T.open) : T.copy);
 
 // Color follows the entity (provider), never its rank.
 const PROVIDER_SLOT = { 'anthropic': 's1', 'openai-codex': 's2', 'nvidia': 's3', 'gemini': 's4', 'copilot': 's5' };

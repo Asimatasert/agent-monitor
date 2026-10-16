@@ -145,8 +145,18 @@ class OpenAction(unittest.TestCase):
     def test_hermes_session_command_has_profile(self):
         o = panel.open_hermes_session("lead", "20260101_000000_abc123", "cli", "Title")
         self.assertEqual(o["command"], "hermes -p lead --resume 20260101_000000_abc123")
-        self.assertIsNone(o["url"])  # a cli session has no verified URL
         self.assertEqual(o["kind"], "hermes-session")
+
+    def test_every_origin_gets_the_url_when_the_app_is_installed(self):
+        # hermes://open/<id> was run for real for a desktop session of another profile, a CLI session and a kanban
+        # worker session: the desktop app opened each of them
+        old = panel.hermes_desktop_installed
+        try:
+            panel.hermes_desktop_installed = lambda: True
+            for origin in ("desktop", "cli", "tui", "kanban", "telegram"):
+                self.assertEqual(panel.open_hermes_session("lead", "s1", origin, "t")["url"], "hermes://open/s1")
+        finally:
+            panel.hermes_desktop_installed = old
 
     def test_default_profile_has_no_p_flag(self):
         self.assertEqual(panel.open_hermes_session("default", "s1", "cli", "t")["command"], "hermes --resume s1")
@@ -206,6 +216,103 @@ class OpenForRow(unittest.TestCase):
 
     def test_unknown_kind_is_none(self):
         self.assertEqual(panel._open_for(self.base(kind="droid"), {})["kind"], "none")
+
+    def test_kanban_worker_row_carries_its_session_url(self):
+        old = panel.hermes_desktop_installed
+        try:
+            panel.hermes_desktop_installed = lambda: True
+            r = self.base(origin="kanban", profile="developer", kanban={"id": "t_1", "board": "default", "title": "C"})
+            o = panel._open_for(r, {}, {})
+            self.assertEqual((o["url"], o["session_url"]), ("hermes://open/kanban", "hermes://open/s1"))
+            only = panel._open_for(self.base(origin="kanban", card_only=True, id="t_1",
+                                             kanban={"id": "t_1", "board": "default", "title": "C"}), {}, {})
+            self.assertNotIn("session_url", only)
+            self.assertFalse(only["running"])
+        finally:
+            panel.hermes_desktop_installed = old
+
+    def test_process_facts_are_always_present(self):
+        o = panel._open_for(self.base(), {}, {})
+        for k in ("running", "pid", "tty", "app", "app_pid", "background", "attach"):
+            self.assertIn(k, o)
+        self.assertFalse(o["running"])  # no pid known
+
+    def test_claude_background_session_gets_an_attach_command(self):
+        r = self.base(kind="claude-code", origin="claude-code", id="29517443-aaaa", _bg=True, _job="29517443", _pid=None)
+        self.assertEqual(panel._open_for(r, {}, {})["attach"], "claude attach 29517443")
+        r = self.base(kind="claude-code", origin="claude-code", id="29517443-aaaa", _bg=False)
+        self.assertIsNone(panel._open_for(r, {}, {})["attach"])
+        self.assertEqual(panel.claude_attach_command("abcdefgh-1234"), "claude attach abcdefgh")  # no job id: short id
+
+    def test_subagent_open_uses_the_parents_process(self):
+        parent = self.base(id="p1", _pid=4242)
+        sub = self.base(id="s9", subagent=True, parent="p1", _psource="cli", parent_title="P")
+        table = {4242: (1, "ttys009", "/usr/bin/python3 hermes")}
+        old = panel.clis.pid_alive
+        try:
+            panel.clis.pid_alive = lambda p: p in table
+            o = panel._open_for(sub, {("lead", "p1"): parent}, table)
+        finally:
+            panel.clis.pid_alive = old
+        self.assertEqual((o["pid"], o["tty"], o["running"]), (4242, "ttys009", True))
+
+
+class ProcessInfo(unittest.TestCase):
+    PS = """\
+    1     0 ??       /sbin/launchd
+ 1692     1 ??       /Applications/Hermes.app/Contents/MacOS/Hermes
+ 1763  1692 ??       /Users/x/python3 -I -c import os
+  500     1 ??       /System/Applications/Utilities/Terminal.app/Contents/MacOS/Terminal
+  510   500 ??       login -pf asim
+  511   510 ttys002  -zsh
+  512   511 ttys002  /Users/x/python3 -m hermes_cli.main --cli
+15734     1 ??       /Users/x/.local/bin/claude daemon run
+15760 15734 ??       claude bg-pty-host --bg-pty-host /tmp/s.sock 200 50 -- /v/claude --bg-spare /tmp/c.sock
+15784 15760 ttys004  claude bg-spare --bg-spare /tmp/c.sock
+  900     1 ??       /Applications/Agent Bar.app/Contents/MacOS/AgentBar
+  901   900 ttys005  /bin/zsh
+"""
+
+    def info(self, pid):
+        table = panel.parse_ps(self.PS)
+        old = panel.clis.pid_alive
+        try:
+            panel.clis.pid_alive = lambda p: True
+            return panel.process_info(pid, table)
+        finally:
+            panel.clis.pid_alive = old
+
+    def test_parse(self):
+        t = panel.parse_ps(self.PS)
+        self.assertEqual(t[511], (510, "ttys002", "-zsh"))
+        self.assertIsNone(t[1763][1])  # "??" = no tty
+
+    def test_desktop_session_is_hosted_by_the_app(self):
+        i = self.info(1763)
+        self.assertEqual((i["app"], i["app_pid"], i["tty"], i["background"]), ("/Applications/Hermes.app", 1692, None, False))
+
+    def test_cli_in_terminal_has_tty_and_terminal_app(self):
+        i = self.info(512)
+        self.assertEqual((i["tty"], i["app"], i["app_pid"]),
+                         ("ttys002", "/System/Applications/Utilities/Terminal.app", 500))
+
+    def test_background_claude_session_has_no_window(self):
+        i = self.info(15784)
+        self.assertEqual((i["app"], i["background"], i["tty"]), (None, True, "ttys004"))
+
+    def test_app_path_with_a_space(self):
+        self.assertEqual(self.info(901)["app"], "/Applications/Agent Bar.app")
+
+    def test_dead_or_unknown_pid(self):
+        self.assertIsNone(self.info(99999))
+        self.assertIsNone(panel.process_info(None, {}))
+        table = panel.parse_ps(self.PS)
+        old = panel.clis.pid_alive
+        try:
+            panel.clis.pid_alive = lambda p: False
+            self.assertIsNone(panel.process_info(512, table))
+        finally:
+            panel.clis.pid_alive = old
 
 
 class HermesState(unittest.TestCase):
