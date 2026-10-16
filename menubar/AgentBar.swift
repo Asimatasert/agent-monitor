@@ -3049,6 +3049,11 @@ final class KeyPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// Test builds only (both unset in the installed app): a second Agent Bar copy can run next to the installed one with its
+/// own hook names (`local.agent.bar.island<suffix>`) and its windows one level above.
+let TEST_HOOK_SUFFIX = ProcessInfo.processInfo.environment["AGENT_BAR_HOOK_SUFFIX"] ?? ""
+let TEST_LEVEL_BOOST = ProcessInfo.processInfo.environment["AGENT_BAR_HOOK_SUFFIX"] == nil ? 0 : 1
+
 @MainActor
 final class IslandController {
     static let shared = IslandController()
@@ -3070,11 +3075,23 @@ final class IslandController {
             Task { @MainActor in IslandController.shared.rebuild() }
         }
         // test hook: `object` = event | hover | compact | drop (used for screenshots)
-        DistributedNotificationCenter.default().addObserver(forName: .init("local.agent.bar.island"), object: nil, queue: .main) { n in
+        DistributedNotificationCenter.default().addObserver(forName: .init("local.agent.bar.island" + TEST_HOOK_SUFFIX), object: nil, queue: .main) { n in
             let what = n.object as? String
             Task { @MainActor in IslandController.shared.debug(what) }
         }
+        DistributedNotificationCenter.default().addObserver(forName: .init("local.agent.bar.click" + TEST_HOOK_SUFFIX), object: nil, queue: .main) { n in
+            let what = n.object as? String
+            Task { @MainActor in IslandController.shared.debugClick(what) }
+        }
         rebuild()
+    }
+
+    /// test hook, object = a Live row's session id (runs that row's click action, the same
+    /// `Opener.open` a mouse click calls) | "icon" (the hover panel's window icon)
+    private func debugClick(_ what: String?) {
+        if what == "icon" { openWindow(); return }
+        guard let what, let row = store?.live?.running.first(where: { $0.id == what }) else { return }
+        Opener.open(row.open)
     }
 
     func rebuild() {
@@ -3093,7 +3110,7 @@ final class IslandController {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = false
-        p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3)
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 3 + TEST_LEVEL_BOOST)
         p.collectionBehavior = [.canJoinAllSpaces, .stationary, .fullScreenAuxiliary, .ignoresCycle]
         p.ignoresMouseEvents = true
         p.acceptsMouseMovedEvents = true
@@ -3158,7 +3175,7 @@ final class IslandController {
         p.isOpaque = false
         p.backgroundColor = .clear
         p.hasShadow = true
-        p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2)
+        p.level = NSWindow.Level(rawValue: NSWindow.Level.mainMenu.rawValue + 2 + TEST_LEVEL_BOOST)
         p.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .ignoresCycle]
         p.becomesKeyOnlyIfNeeded = false
         let root = Popover(store: store)
