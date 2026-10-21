@@ -144,7 +144,7 @@ struct LocalShare: Decodable {
     let local: Double?; let other: Double?; let localCost: Double?; let basis: String?; let rate: Double?
 }
 
-struct AccountsResp: Decodable { let history: [QHist] }
+struct AccountsResp: Decodable { let history: [QHist]; let localHistory: [QHist]? }
 struct QHist: Decodable { let provider: String; let window: String; let points: [[Double]] }
 
 struct Overview: Decodable { let usage: Usage; let clis: CliSummary; let kanban: [Board] }
@@ -1463,6 +1463,7 @@ final class Store: ObservableObject {
     @Published var live: LiveData?
     @Published var overview: Overview?
     @Published var history: [QHist] = []
+    @Published var localHistory: [QHist] = []  // this Mac's share of each Claude window over time
     @Published var health: HealthResp?
     @Published var month: Overview?
     @Published var topToday: [TopSession] = []
@@ -1603,6 +1604,7 @@ final class Store: ObservableObject {
             }
             if let a = try? await Store.get("/api/accounts?from=\(isoDay(-1))&to=\(isoDay(0))", as: AccountsResp.self) {
                 history = a.history
+                localHistory = a.localHistory ?? []
             }
             if let h = try? await Store.get("/api/health", as: HealthResp.self, snake: false) {
                 health = h
@@ -2146,6 +2148,7 @@ struct QuotasTab: View {
                 ForEach(metered, id: \.provider) { item in
                     let open = override[item.provider] ?? store.anim.isOpen(item.provider)
                     QuotaCard(item: item, burn: d.burn ?? [], history: store.history.filter { $0.provider == item.provider },
+                              localHistory: store.localHistory.filter { $0.provider == item.provider },
                               now: d.now, collapsed: !open) {
                         withAnimation(motionOn() ? .snappy : nil) { override[item.provider] = !open }
                     }
@@ -2192,12 +2195,14 @@ struct HistPoint: Identifiable {
     let t: Date
     let window: String
     let used: Double
+    var kind = ""  // account | this Mac (dashed)
 }
 
 struct QuotaCard: View {
     let item: QuotaItem
     let burn: [Burn]
     let history: [QHist]
+    var localHistory: [QHist] = []
     let now: Double
     var collapsed = false
     var toggle: () -> Void = {}
@@ -2237,16 +2242,23 @@ struct QuotaCard: View {
                          share: share(w))
                     .opacity(item.stale == true ? 0.6 : 1)
             }
+            let acct = L("Account", "Hesap"), mac = L("This Mac ≈", "Bu Mac ≈")
             let pts = history.flatMap { h in
-                h.points.filter { $0.count >= 2 }.map { HistPoint(t: Date(timeIntervalSince1970: $0[0]), window: wName(h.window), used: $0[1]) }
+                h.points.filter { $0.count >= 2 }.map { HistPoint(t: Date(timeIntervalSince1970: $0[0]), window: wName(h.window), used: $0[1], kind: acct) }
             }
+            // this Mac's share as a dashed line in the window's colour (only where this Mac used the account at all)
+            let mine = showLocal ? localHistory.filter { h in h.points.contains { $0.count >= 2 && $0[1] > 0 } }.flatMap { h in
+                h.points.filter { $0.count >= 2 }.map { HistPoint(t: Date(timeIntervalSince1970: $0[0]), window: wName(h.window), used: $0[1], kind: mac) }
+            } : []
             // a flat line (e.g. an exhausted account pinned at 100 %) carries no information
-            if pts.count >= 2, Set(pts.map(\.used)).count > 1 {
-                Chart(pts) { p in
-                    LineMark(x: .value("Zaman", p.t), y: .value("%", p.used))
+            if pts.count >= 2, Set(pts.map(\.used)).count > 1 || !mine.isEmpty {
+                Chart(pts + mine) { p in
+                    LineMark(x: .value("Zaman", p.t), y: .value("%", p.used), series: .value("Seri", p.window + p.kind))
                         .foregroundStyle(by: .value("Pencere", p.window))
+                        .lineStyle(by: .value("Kaynak", p.kind))
                         .interpolationMethod(.stepEnd)
                 }
+                .chartLineStyleScale([acct: StrokeStyle(lineWidth: 1.6), mac: StrokeStyle(lineWidth: 1.6, dash: [4, 3])])
                 .chartYScale(domain: 0...100)
                 .chartXAxis { AxisMarks(values: .automatic(desiredCount: 4)) { _ in AxisGridLine(); AxisValueLabel(format: .dateTime.hour().minute()) } }
                 .chartLegend(position: .bottom, alignment: .leading)

@@ -94,6 +94,19 @@ class Share(unittest.TestCase):
         self.assertEqual(out["a#1"]["Sonnet week"]["basis"], "idle")
 
 
+class Series(unittest.TestCase):
+    def test_series_follows_the_rise_while_busy_and_restarts_with_the_window(self):
+        rs = readings(5 * H, [(H, 0), (H + 300, 4), (H + 1200, 4), (2 * H, 10)]) + readings(10 * H, [(5 * H + 60, 0)])
+        costs = ls.Costs([(H + 100, 1.0, "m")])
+        out = ls.local_series(rs, costs, 5 * H, None, 6 * H)
+        self.assertEqual([v for _, v in out], [0.0, 4.0, 4.0, 4.0, 0.0])
+
+    def test_series_is_capped_by_rate_times_cost(self):
+        rs = readings(5 * H, [(H, 0), (H + 300, 10)])
+        out = ls.local_series(rs, ls.Costs([(H + 100, 2.0, "m")]), 5 * H, 2.0, 2 * H)
+        self.assertEqual(out[-1][1], 4.0)
+
+
 class Helpers(unittest.TestCase):
     def test_intervals_skip_a_reset(self):
         rs = [(0, 10, 100), (60, 12, 100), (120, 0, 5000)]

@@ -433,7 +433,7 @@ function niceMax(v) {
 }
 function legend(series, kind = 'rect') {
   if (series.length < 2) return null;
-  return h('div', { class: 'legend' }, series.map(se => h('span', {}, h('i', { class: kind === 'line' ? 'line' : '', style: `background:${se.color}` }), se.label)));
+  return h('div', { class: 'legend' }, series.map(se => h('span', {}, h('i', { class: kind === 'line' ? 'line' : '', style: se.dash ? `background:none;border-top:2px dashed ${se.color};height:0` : `background:${se.color}` }), se.label)));
 }
 
 const widthCache = {};
@@ -534,7 +534,7 @@ function lineChartSvg(W, series, { height = 200, yMax = 100, fmt = v => '%' + Ma
   series.forEach(se => {
     if (!se.points.length) return;
     const d = se.points.map((p, i) => (i ? 'L' : 'M') + X(p[0]).toFixed(1) + ',' + Y(p[1]).toFixed(1)).join(' ');
-    svg.append(s('path', { d, fill: 'none', stroke: se.color, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round' }));
+    svg.append(s('path', { d, fill: 'none', stroke: se.color, 'stroke-width': 2, 'vector-effect': 'non-scaling-stroke', 'stroke-linejoin': 'round', ...(se.dash ? { 'stroke-dasharray': '5 4' } : {}) }));
   });
   const cross = s('line', { x1: 0, x2: 0, y1: T, y2: T + ph, stroke: 'var(--muted)', 'stroke-width': 1, opacity: 0, 'vector-effect': 'non-scaling-stroke' });
   const hit = s('rect', { class: 'hit', x: L, y: T, width: pw, height: ph });
@@ -1095,7 +1095,8 @@ function renderAccounts(d) {
   noteQuotaItems(d.quotas.items);
   const u = usageFor(d.usage);
   d = { ...d, quotas: { ...d.quotas, items: (d.quotas.items || []).filter(it => fIs('provider', pBase(it.provider))) },
-        history: d.history.filter(x => fIs('provider', pBase(x.provider))) };
+        history: d.history.filter(x => fIs('provider', pBase(x.provider))),
+        local_history: (d.local_history || []).filter(x => fIs('provider', pBase(x.provider))) };
   const quotaGrid = h('div', { class: 'grid g3' }, (d.quotas.items || []).map(it => quotaCard(it)));
   const refresh = h('button', { class: 'ctl', onclick: async ev => { ev.target.textContent = 'çekiliyor…'; const x = await api('accounts', '&force=1'); $('p-accounts').replaceChildren(renderAccounts(x)); } }, 'Kotaları şimdi çek');
   // the quota item is "anthropic#<account>", the usage row plain "anthropic": match on the provider, join every account's credentials
@@ -1110,6 +1111,11 @@ function renderAccounts(d) {
   ], u.by_provider));
   const hist = d.history.filter(x => x.points.length);
   const hs = hist.map((x, i) => ({ label: `${pName(x.provider)} · ${winName(x.window)}`, color: ['var(--s1)', 'var(--s2)', 'var(--s3)', 'var(--s4)', 'var(--s5)'][i % 5], points: x.points }));
+  // this Mac's share of each Claude window: dashed, in the colour of its account line (estimate; only where it used it)
+  (d.local_history || []).filter(x => x.points.some(p => p[1] > 0)).forEach(x => {
+    const i = hist.findIndex(y => y.provider === x.provider && y.window === x.window);
+    if (i >= 0) hs.push({ label: `${pName(x.provider)} · ${winName(x.window)} · bu Mac ≈`, color: hs[i].color, points: x.points, dash: true });
+  });
   const histCard = card('Kota geçmişi', 'kullanım yüzdesi · panel 5 dk\'da bir kaydeder',
     hs.length ? [legend(hs, 'line'), lineChart(hs)] : h('div', { class: 'empty' }, 'Henüz kayıt yok. Panel açık kaldıkça kota geçmişi burada birikir.'),
     { tableView: () => table([{ label: 'Pencere', get: r => r.label }, { label: 'Son değer', n: 1, get: r => fmtPct(r.points.at(-1)?.[1]) }, { label: 'Ölçüm', n: 1, get: r => r.points.length }], hs) });

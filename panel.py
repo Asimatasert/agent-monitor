@@ -861,8 +861,26 @@ def _attach_local(items, now=None):
     by, lost = localshare.attribute(provs, cc, order, fill_first, history,
                                     _local_claude_events(since), _local_hermes_events(since))
     res = localshare.shares(claude, history, by, lost, now)
+    series = {}
     for it in claude:
         it["local"] = res.get(it["provider"]) or {}
+        for label, sh in it["local"].items():
+            if sh.get("basis") == "unknown":
+                continue
+            costs = localshare.Costs(by.get(it["provider"], []), localshare.MODEL_FILTER.get(label))
+            series[(it["provider"], label)] = localshare.local_series(
+                history.get(it["provider"], {}).get(label, []), costs, localshare.WINDOW_LEN[label], sh.get("rate"), now)
+    _local_hist.clear()
+    _local_hist.update(series)
+
+
+_local_hist = {}  # (provider, window) -> [(ts, this Mac's %)], rebuilt with every quota refresh
+
+
+def local_history(start, end):
+    """This Mac's share of each Claude window over time (same shape as quota_history)."""
+    return [{"provider": p, "window": w, "points": [[t, v] for t, v in pts if start <= t < end]}
+            for (p, w), pts in list(_local_hist.items())]
 
 
 def session_account(kind, provider, model, items, now=None):
@@ -1781,7 +1799,7 @@ def route(path, q):
     if path == "/api/accounts":
         return {"usage": usage(start, end, days, profile),
                 "quotas": quotas(force=q.get("force") == ["1"]),
-                "history": quota_history(start, end)}
+                "history": quota_history(start, end), "local_history": local_history(start, end)}
     if path == "/api/agents":
         return {"agents": agents(start, end), "usage": usage(start, end, days, profile)}
     if path == "/api/subagents":

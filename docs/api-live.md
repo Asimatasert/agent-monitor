@@ -230,6 +230,8 @@ Credentials in Hermes' pool are grouped by the **account** behind them.
   `rate` (%/$) = the smallest final-value / local-cost over the window instances this Mac spent ≥ $1 in.
   `basis`: `idle` (nothing ran here: local 0), `estimate`, `bound` (no rate yet: `local` is an upper limit),
   `unknown` (some local requests could not be attributed; `local`/`other` are `null`). Always an estimate.
+* `/api/accounts` gains `local_history` (same shape as `history`): this Mac's share of each Claude window over time,
+  one point per quota reading, by the same rule with today's rate. Clients draw it dashed in the window's colour.
 * Live rows (`running[]`) gain `account` (that `name`) and `account_provider` (the item id) when there are two or more
   Claude accounts: Claude Code rows → its login's account; Hermes rows on Anthropic → where the pool sends a request now.
 

@@ -179,6 +179,31 @@ def attribute(items_providers, claude_code_item, hermes_order, fill_first, histo
     return by, lost
 
 
+def local_series(readings, costs, length, rate, now):
+    """This Mac's share over time for one window, one point per reading -> [(ts, local %)].
+    The same rule as window_share at every reading (rise seen while busy, capped by rate x cost so far and by the
+    value), in one pass; the rate is today's, applied to the past."""
+    out = []
+    inst = None   # reset of the window instance being walked
+    bound = 0.0
+    prev = None
+    for t, u, r in sorted(readings):
+        if u is None or t > now + 60:
+            continue
+        if r and not _same(inst, r):  # a new window instance starts
+            inst, start = r, r - length
+            bound = u if costs.between(start - 1, t) > 0 else 0.0
+        elif prev is not None and inst and u > prev[1] and costs.between(prev[0] - LAG, t) > 0:
+            bound += u - prev[1]
+        prev = (t, u)
+        if not inst:
+            continue
+        cost = costs.between(inst - length, t)
+        local = 0.0 if cost <= 0 else min(u, bound, rate * cost) if rate else min(u, bound)
+        out.append((t, round(local, 1)))
+    return out
+
+
 def shares(items, history, events_by, lost, now):
     """Per item provider -> {window label: window_share}. history: {provider: {window: sorted readings}}."""
     out = {}
