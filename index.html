@@ -378,13 +378,16 @@ const srcColor = k => `var(--${SOURCE_SLOT[k] || 'other'})`;
 const srcName = k => SOURCE_NAME[k] || k;
 // "anthropic#work" = one of several accounts of a provider
 let MULTI = new Set();   // providers with >= 2 account items (set by noteQuotaItems)
+let ACCT_NAME = {};      // provider id -> the account's name in Hermes' pool (shown instead of the account key)
 const pBase = p => String(p).split('#')[0];
 function noteQuotaItems(items) {
   const c = {}; (items || []).forEach(it => { c[pBase(it.provider)] = (c[pBase(it.provider)] || 0) + 1; });
   MULTI = new Set(Object.keys(c).filter(k => c[k] > 1));
+  ACCT_NAME = Object.fromEntries((items || []).filter(it => it.name).map(it => [it.provider, it.name]));
 }
-const pShort = p => (PROVIDER_NAME[pBase(p)] || pBase(p)).split(' ')[0] + (String(p).includes('#') && MULTI.has(pBase(p)) ? ' ' + String(p).split('#')[1] : '');
-const pName = p => { const [b, acct] = String(p).split('#'); const n = PROVIDER_NAME[b] || b; return acct && MULTI.has(b) ? `${n} · ${acct}` : n; };
+const acctOf = p => ACCT_NAME[p] || String(p).split('#')[1];
+const pShort = p => (PROVIDER_NAME[pBase(p)] || pBase(p)).split(' ')[0] + (String(p).includes('#') && MULTI.has(pBase(p)) ? ' ' + acctOf(p) : '');
+const pName = p => { const [b, acct] = String(p).split('#'); const n = PROVIDER_NAME[b] || b; return acct && MULTI.has(b) ? `${n} · ${acctOf(p)}` : n; };
 
 // Status: reserved colors, always with icon + label.
 const ICONS = {
@@ -616,12 +619,29 @@ const kpi = (label, value, hint) => h('div', { class: 'card kpi' }, h('div', { c
 
 const WIN_NAME = { 'Current session': 'Oturum', 'Current day': 'Gün', 'Current week': 'Hafta', 'Current month': 'Ay', 'Premium requests': 'Premium istek', 'Opus week': 'Opus hafta', 'Sonnet week': 'Sonnet hafta' };
 const winName = l => WIN_NAME[l] || l;
-function gauge(w) {
+/** This Mac's part of an account window (server estimate, localshare.py): text + tooltip. */
+function shareText(s) {
+  if (!s) return null;
+  if (s.local == null) return 'Bu Mac: bilinmiyor (bazı istekler bir hesaba eşlenemedi)';
+  if (s.basis === 'idle') return 'Bu Mac: %0 — hepsi başka yerden';
+  const pre = s.basis === 'bound' ? 'en fazla ' : '≈';
+  return `Bu Mac ${pre}${fmtPct(s.local)} · diğer ${s.basis === 'bound' ? '≥' : '≈'}${fmtPct(s.other || 0)}`;
+}
+const shareWhy = s => 'Tahmin. Anthropic yalnızca hesabın toplamını verir; bu Mac\'in payı burada çalışanlardan (Claude Code + Hermes, API karşılığı '
+  + fmtUsd(s.local_cost || 0) + ')' + (s.rate ? ` ve bu hesabın geçmişinden öğrenilen $ başına ≈%${s.rate.toFixed(2)} ile` : '')
+  + ' hesaplanır; bu Mac çalışırken görülen artıştan fazla olamaz.' + (s.basis === 'bound' ? ' Oran için henüz yeterli geçmiş yok: değer bir üst sınır.' : '');
+function gauge(w, share) {
   const p = w.used == null ? null : Math.max(0, Math.min(100, w.used));
   const tone = p == null ? 'var(--muted)' : p >= 90 ? 'var(--critical)' : p >= 70 ? 'var(--warn)' : 'var(--good)';
+  const mine = share && share.local != null ? Math.max(0, Math.min(p ?? 0, share.local)) : null;
+  // with a local share: this Mac's part solid, the rest (other computers) lighter
+  const fills = mine == null ? [h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })]
+    : [h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone};opacity:.38;position:absolute;left:0;top:0;bottom:0` }),
+       h('div', { class: 'fill', style: `width:${mine}%;background:${tone};position:absolute;left:0;top:0;bottom:0` })];
   return h('div', { class: 'gauge' },
     h('div', { class: 'row' }, h('span', {}, winName(w.label)), h('b', {}, p == null ? '—' : fmtPct(p) + (w.stale ? ' (son değer)' : ' kullanıldı'))),
-    h('div', { class: 'track', style: w.stale ? 'opacity:.55' : '' }, h('div', { class: 'fill', style: `width:${p ?? 0}%;background:${tone}` })),
+    h('div', { class: 'track', style: (w.stale ? 'opacity:.55;' : '') + (mine == null ? '' : 'position:relative') }, ...fills),
+    share ? h('div', { class: 'sub', style: 'font-size:11.5px', title: shareWhy(share) }, shareText(share)) : null,
     h('div', { class: 'sub', style: 'font-size:11.5px' }, [until(w.reset), w.detail].filter(Boolean).join(' · ')));
 }
 
@@ -640,7 +660,7 @@ function quotaCard(it, burn = []) {
   const kids = [];
   if (it.stale) kids.push(h('div', { class: 'note', style: 'margin:0;color:var(--warn)', title: unavailText(it) }, staleText(it)));
   it.windows.forEach(w => {
-    kids.push(gauge({ ...w, stale: it.stale }));
+    kids.push(gauge({ ...w, stale: it.stale }, (it.local || {})[w.label]));
     const b = burn.find(x => x.provider === it.provider && x.window === w.label);
     if (b && b.per_hour > 0.01 && !it.stale) kids.push(h('div', { class: 'note', style: 'margin-top:0' },
       `Saatte +%${b.per_hour.toFixed(1)}` + (b.eta_full ? ` · bu hızla ${new Date(b.eta_full * 1000).toLocaleString('tr-TR', { weekday: 'short', hour: '2-digit', minute: '2-digit' })} dolar` : '')));
@@ -976,7 +996,8 @@ function renderLive(d) {
         h('span', { class: 'chip', style: r.source ? `color:${srcColor(r.source)};font-weight:600` : '' }, whoName(r)),
         og ? h('span', { class: 'chip' }, og) : null,
         r.kanban ? h('span', { class: 'chip', title: r.kanban.title }, 'kart ' + r.kanban.id) : null,
-        r.model ? h('span', { class: 'chip' }, r.model) : null, openHint(r.open)),
+        r.model ? h('span', { class: 'chip' }, r.model) : null,
+        r.account ? h('span', { class: 'chip', title: 'Bu oturumun kullandığı Claude hesabı (Hermes havuzundaki adı)' }, '@' + r.account) : null, openHint(r.open)),
       meta, act ? h('div', { class: 'act', title: act }, '↳ ' + act) : null);
     return h('div', { class: child ? 'child' : '' }, openable(row, r.open));
   };

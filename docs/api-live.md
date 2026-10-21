@@ -212,6 +212,27 @@ Credentials in Hermes' pool are grouped by the **account** behind them.
   `accounts_count` (accounts, only where grouped by identity, else `null`), `credentials_count`, `account_keys`.
   "1 account · 2 credentials" = `accounts_count` / `credentials_count`.
 
+### Account name and this Mac's share (`name`, `local`)
+
+```json
+{"provider": "anthropic#0a1b2c3d", "name": "work",
+ "local": {"Current session": {"local": 13.0, "other": 7.0, "local_cost": 48.6, "basis": "estimate", "rate": 0.41},
+           "Current week":    {"local": 9.0,  "other": 1.0, "local_cost": 184.9, "basis": "estimate", "rate": 0.054}}}
+```
+
+* `name` — the label of the account's first credential in Hermes' pool (priority order), skipping the Claude Code login
+  and unverified credentials; `null` for a plain `anthropic` item. It is runtime data from `auth.json`, never stored.
+* `local` — per window (session / week / Opus week / Sonnet week): how much of the account-wide `used` this Mac caused
+  (`local`) and how much came from elsewhere (`other`, e.g. another computer on the same account), in percent points.
+  Computed by `localshare.py`: local requests (Claude Code transcripts, Hermes `session_model_usage`) are attributed to
+  an account (Claude Code → its own login; Hermes → its fill_first pool order, skipping accounts that were full), then
+  `local = min(rate × local $, every rise seen while this Mac was busy, used)`.
+  `rate` (%/$) = the smallest final-value / local-cost over the window instances this Mac spent ≥ $1 in.
+  `basis`: `idle` (nothing ran here: local 0), `estimate`, `bound` (no rate yet: `local` is an upper limit),
+  `unknown` (some local requests could not be attributed; `local`/`other` are `null`). Always an estimate.
+* Live rows (`running[]`) gain `account` (that `name`) and `account_provider` (the item id) when there are two or more
+  Claude accounts: Claude Code rows → its login's account; Hermes rows on Anthropic → where the pool sends a request now.
+
 ## Not changed on purpose (needs the interface work)
 
 `provider: "bilinmiyor"`, `assignee: "atanmamış"` (Turkish data values, S-12), `request_count` (S-13) and `profile` of CLI

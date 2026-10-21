@@ -10,7 +10,7 @@ private let API = "http://127.0.0.1:8777"
 // ---------- data (subset of the API) ----------
 
 struct WQuotaWindow: Decodable { let label: String; let used: Double?; let reset: Double? }
-struct WQuotaItem: Decodable { let provider: String; let windows: [WQuotaWindow]? }
+struct WQuotaItem: Decodable { let provider: String; let windows: [WQuotaWindow]?; let name: String? }
 struct WQuotas: Decodable { let items: [WQuotaItem]? }
 struct WSession: Decodable { let title: String?; let status: String; let subagent: Bool; let source: String?; let profile: String?; let working: Bool?; let state: String? }
 struct WLive: Decodable { let running: [WSession]; let quotas: WQuotas?; let cost_60m: Double? }
@@ -24,7 +24,7 @@ struct WClis: Decodable { let daily: [WCliDay] }
 struct WOverview: Decodable { let usage: WUsage; let clis: WClis }
 
 struct Snapshot {
-    struct Quota: Identifiable { let id: String; let provider: String; let window: String; let used: Double; let reset: Double? }
+    struct Quota: Identifiable { let id: String; let provider: String; let window: String; let used: Double; let reset: Double?; var name: String? = nil }
     var quotas: [Quota] = []
     var running = 0
     var working = 0
@@ -61,7 +61,7 @@ func loadSnapshot() async -> Snapshot {
     var s = Snapshot()
     for item in live.quotas?.items ?? [] {
         for w in item.windows ?? [] {
-            if let u = w.used { s.quotas.append(.init(id: item.provider + "|" + w.label, provider: item.provider, window: w.label, used: u, reset: w.reset)) }
+            if let u = w.used { s.quotas.append(.init(id: item.provider + "|" + w.label, provider: item.provider, window: w.label, used: u, reset: w.reset, name: item.name)) }
         }
     }
     let mains = live.running.filter { $0.status == "running" && !$0.subagent }
@@ -91,12 +91,13 @@ func loadSnapshot() async -> Snapshot {
 let isTR = (Locale.preferredLanguages.first ?? "en").hasPrefix("tr")
 func T(_ en: String, _ tr: String) -> String { isTR ? tr : en }
 
-/// "anthropic#work" = one of several accounts of a provider: shown as "Claude · work".
-func providerName(_ p: String) -> String {
+/// "anthropic#work" = one of several accounts of a provider: shown as "Claude · work" (name = the account's name in
+/// Hermes' pool, when the server sent it; else the account key).
+func providerName(_ p: String, name: String? = nil) -> String {
     let parts = p.split(separator: "#", maxSplits: 1).map(String.init)
     let base = ["anthropic": "Claude", "openai-codex": "Codex", "copilot": "Copilot", "gemini": "Gemini", "nvidia": "NVIDIA",
                 "openrouter": "OpenRouter"][parts[0]] ?? parts[0]
-    return parts.count > 1 ? "\(base) · \(parts[1])" : base
+    return parts.count > 1 ? "\(base) · \(name ?? parts[1])" : base
 }
 
 func windowName(_ w: String) -> String {
@@ -172,7 +173,7 @@ struct QuotaBar: View {
     var body: some View {
         HStack(spacing: 6) {
             (logo(quota.provider) ?? Image(systemName: "gauge.medium")).resizable().scaledToFit().frame(width: 11, height: 11)
-            Text("\(providerName(quota.provider)) · \(windowName(quota.window))").font(.caption).lineLimit(1)
+            Text("\(providerName(quota.provider, name: quota.name)) · \(windowName(quota.window))").font(.caption).lineLimit(1)
             Spacer(minLength: 4)
             ProgressView(value: min(quota.used, 100), total: 100).tint(levelTint(quota.used)).frame(width: 56)
             Text("\(Int(quota.used))%").font(.caption.weight(.semibold)).monospacedDigit().frame(width: 34, alignment: .trailing)
@@ -221,7 +222,7 @@ struct SmallView: View {
             VStack(alignment: .leading, spacing: 8) {
                 HStack(spacing: 4) {
                     (logo(rings.first?.provider ?? "anthropic") ?? Image(systemName: "gauge.medium")).resizable().scaledToFit().frame(width: 11)
-                    Text(providerName(rings.first?.provider ?? "anthropic")).font(.caption.weight(.semibold))
+                    Text(providerName(rings.first?.provider ?? "anthropic", name: rings.first?.name)).font(.caption.weight(.semibold))
                 }
                 HStack(spacing: 8) { ForEach(rings) { Ring(quota: $0, size: 58) } }
                     .frame(maxWidth: .infinity)

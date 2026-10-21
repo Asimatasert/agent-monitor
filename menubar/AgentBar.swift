@@ -112,6 +112,8 @@ struct Session: Decodable, Identifiable {
     let cardOnly: Bool?         // a running kanban card without a session row
     let kanban: KanbanRef?      // the paired card (kanban worker rows only)
     let open: OpenAction?
+    let account: String?        // the Claude account (its name in Hermes' pool) it runs on, when there are several
+    let accountProvider: String?
     var isRunning: Bool { status == "running" }
     var isWorking: Bool { isRunning && working == true }
     // grouping key/name: who runs the session (Hermes profile / Claude Code / Copilot CLI) — not a provider account
@@ -124,6 +126,8 @@ struct Quotas: Decodable { let items: [QuotaItem]? }
 struct QuotaItem: Decodable {
     let provider: String; let accounts: [Account]?; let windows: [QuotaWindow]?
     let accountKey: String?     // set when the account identity was read (one item per real account)
+    let name: String?           // the account's name in Hermes' pool (first credential's label)
+    let local: [String: LocalShare]?  // window label -> this Mac's share of it (estimate)
     // windows are the last known reading, not a fresh one (rate limited / unreadable right now)
     let stale: Bool?; let fetchedAt: Double?; let unavailableCode: String?; let unavailableHttp: Double?; let retryAt: Double?
 }
@@ -134,6 +138,11 @@ struct Account: Decodable {
     var unverified: Bool { verification == "unverified" }
 }
 struct QuotaWindow: Decodable { let label: String; let used: Double?; let reset: Double?; let detail: String? }
+/// This Mac's part of an account-wide window, in percent points (server: localshare.py). Always an estimate.
+/// basis: idle (nothing ran here) | estimate | bound (only an upper limit yet) | unknown
+struct LocalShare: Decodable {
+    let local: Double?; let other: Double?; let localCost: Double?; let basis: String?; let rate: Double?
+}
 
 struct AccountsResp: Decodable { let history: [QHist] }
 struct QHist: Decodable { let provider: String; let window: String; let points: [[Double]] }
@@ -328,10 +337,18 @@ let WINDOW_NAME: [String: (String, String)] = [
 func pBase(_ p: String) -> String { String(p.split(separator: "#", maxSplits: 1).first ?? Substring(p)) }
 /// Providers that currently have >= 2 account items (set by the store); only these get the "· <account>" suffix.
 var multiAccountBases: Set<String> = []
+/// provider id -> the account's name in Hermes' pool (set by the store); shown instead of the account key.
+var accountNames: [String: String] = [:]
 func pName(_ p: String) -> String {
     let parts = p.split(separator: "#", maxSplits: 1).map(String.init)
     let base = parts[0] == "bilinmiyor" ? L("Unknown", "Bilinmiyor") : (PROVIDER_NAME[parts[0]] ?? parts[0])
-    return parts.count > 1 && multiAccountBases.contains(parts[0]) ? "\(base) · \(parts[1])" : base
+    return parts.count > 1 && multiAccountBases.contains(parts[0]) ? "\(base) · \(accountNames[p] ?? parts[1])" : base
+}
+/// Short name of an account item when the provider has several ("work"), else nil.
+func accountShort(_ p: String) -> String? {
+    let parts = p.split(separator: "#", maxSplits: 1).map(String.init)
+    guard parts.count > 1, multiAccountBases.contains(parts[0]) else { return nil }
+    return accountNames[p] ?? parts[1]
 }
 func credKind(_ source: String?) -> String {
     guard let s = source else { return "" }
@@ -1140,6 +1157,10 @@ enum Pref {
     static let hoverSessions = "hoverSessions"
     static let hoverCost = "hoverCost"
     static let liveEvery = "liveEvery"      // live refresh interval (s)
+    static let quotaScope = "quotaScope"    // account | local: what bar / rings / hover percentages show
+    static let showLocal = "showLocalShare" // quota cards and hover rows show this Mac's share of each window
+    static let islandQuotas = "islandQuotas"  // "bar" = same as the menu bar, else comma-joined "provider|window" keys
+    static let islandBadge = "islandBadge"  // account initial on the notch rings when a provider has several accounts
     /// One-time copy of the settings from the app's former identity (Hermes Bar, local.hermes.bar).
     static func migrateFromHermesBar() {
         let d = UserDefaults.standard
@@ -1147,7 +1168,7 @@ enum Pref {
         let keys = [barSpark, barCount, barTokens, barLeft, barQuotas, barAutoCollapse, barMotion, notifyQuota, notifyKanban,
                     notifySessions, autoStart, notifyHealth, budgetDay, budgetMonth, notifyBudget, lang, display, islandEvents,
                     islandEars, stepPct, holdSec, peekSec, eventSec, hoverDelay, earWidth, rightEar, islandClick,
-                    hoverQuotas, hoverSessions, hoverCost, liveEvery, "tab", "healthView", "usageMetric", "topRange", "quotaNotified", "budgetNotified", "quotaSoonNotified"]
+                    hoverQuotas, hoverSessions, hoverCost, liveEvery, quotaScope, showLocal, islandQuotas, islandBadge, "tab", "healthView", "usageMetric", "topRange", "quotaNotified", "budgetNotified", "quotaSoonNotified"]
         for k in keys where d.object(forKey: k) == nil {
             if let v = old.object(forKey: k) { d.set(v, forKey: k) }
         }
@@ -1159,7 +1180,7 @@ enum Pref {
         [barSpark, barCount, barTokens, barLeft, barQuotas, barAutoCollapse, barMotion, notifyQuota, notifyKanban,
          notifySessions, autoStart, notifyHealth, budgetDay, budgetMonth, notifyBudget, display, islandEvents, islandEars,
          stepPct, holdSec, peekSec, eventSec, hoverDelay, earWidth, rightEar, islandClick, hoverQuotas, hoverSessions,
-         hoverCost, liveEvery]
+         hoverCost, liveEvery, quotaScope, showLocal, islandQuotas, islandBadge]
     }
 
     /// Back to the registered defaults (the removed keys fall through to them).
@@ -1176,7 +1197,8 @@ enum Pref {
                                                   display: "both", islandEvents: true,
                                                   islandEars: "hover", stepPct: 2.0, holdSec: 20.0, peekSec: 15.0, eventSec: 4.5,
                                                   hoverDelay: 0.22, earWidth: 64.0, rightEar: "sessions", islandClick: "panel",
-                                                  hoverQuotas: true, hoverSessions: true, hoverCost: true, liveEvery: LIVE_EVERY])
+                                                  hoverQuotas: true, hoverSessions: true, hoverCost: true, liveEvery: LIVE_EVERY,
+                                                  quotaScope: "account", showLocal: true, islandQuotas: "bar", islandBadge: true])
     }
     static func on(_ key: String) -> Bool { UserDefaults.standard.bool(forKey: key) }
     static func num(_ key: String) -> Double { UserDefaults.standard.double(forKey: key) }
@@ -1480,7 +1502,7 @@ final class Store: ObservableObject {
     /// A quota picked for the bar crossed a 2 % step: the island shows its ears for a moment (no big pop-down).
     func quotaStepEvent(key: String, provider: String, window: QuotaWindow) {
         let selection = (UserDefaults.standard.string(forKey: Pref.barQuotas) ?? "auto").split(separator: ",").map(String.init)
-        guard chosenQuotas(selection).contains(where: { $0.key == key }) else { return }
+        guard (chosenQuotas(selection) + chosenQuotas(islandSelection)).contains(where: { $0.key == key }) else { return }
         Island.shared.peek(provider)
         reloadWidgets()
     }
@@ -1528,6 +1550,8 @@ final class Store: ObservableObject {
                 let d = try await Store.get("/api/live", as: LiveData.self)
                 var perBase: [String: Int] = [:]
                 for it in d.quotas?.items ?? [] { perBase[pBase(it.provider), default: 0] += 1 }
+                accountNames = Dictionary((d.quotas?.items ?? []).compactMap { it in it.name.map { (it.provider, $0) } },
+                                          uniquingKeysWith: { a, _ in a })
                 multiAccountBases = Set(perBase.filter { $0.value > 1 }.keys)
                 live = d
                 let n = mains.count, w = workingMains.count
@@ -1655,11 +1679,33 @@ final class Store: ObservableObject {
         (live?.quotas?.items ?? []).first { $0.provider == provider }?.stale == true
     }
 
-    /// Every quota window the bar can show, as (key, provider, window).
+    /// Every quota window the bar can show, as (key, provider, window). With "This Mac" picked in the settings a
+    /// window that has a local share carries that share as `used` (bar, rings, hover); the others stay account-wide.
     var quotaOptions: [(key: String, provider: String, window: QuotaWindow)] {
-        (live?.quotas?.items ?? []).flatMap { item in
-            (item.windows ?? []).filter { $0.used != nil }.map { ("\(item.provider)|\($0.label)", item.provider, $0) }
+        let local = Pref.str(Pref.quotaScope) == "local"
+        return (live?.quotas?.items ?? []).flatMap { item in
+            (item.windows ?? []).filter { $0.used != nil }.map { w in
+                let mine = local ? item.local?[w.label]?.local : nil
+                let shown = mine.map { QuotaWindow(label: w.label, used: $0, reset: w.reset, detail: w.detail) } ?? w
+                return ("\(item.provider)|\(w.label)", item.provider, shown)
+            }
         }
+    }
+
+    /// The account-wide value of a window (whatever the scope setting says).
+    func accountUsed(_ provider: String, _ window: String) -> Double? {
+        (live?.quotas?.items ?? []).first { $0.provider == provider }?.windows?.first { $0.label == window }?.used
+    }
+
+    /// This Mac's share of an account window (server estimate), nil when there is none.
+    func localShare(_ provider: String, _ window: String) -> LocalShare? {
+        (live?.quotas?.items ?? []).first { $0.provider == provider }?.local?[window]
+    }
+
+    /// The notch's own quota selection ("bar" = the menu bar's).
+    var islandSelection: [String] {
+        let own = Pref.str(Pref.islandQuotas)
+        return (own.isEmpty || own == "bar" ? Pref.str(Pref.barQuotas) : own).split(separator: ",").map(String.init)
     }
 
     /// The most-used window among usable providers, as an option (for the "auto" bar mode).
@@ -1731,6 +1777,7 @@ struct BarLabel: View {
     @AppStorage(Pref.barTokens) private var tokens = false
     @AppStorage(Pref.barLeft) private var left = false
     @AppStorage(Pref.barQuotas) private var quotas = "auto"
+    @AppStorage(Pref.quotaScope) private var scope = "account"  // observed: the bar redraws when it changes
     var body: some View {
         if store.offline {
             Image(systemName: "bolt.horizontal.circle")
@@ -2021,7 +2068,7 @@ struct SessionRow: View {
                 if s.subagent, let parent = s.parentTitle ?? modelShort(s.parentModel) {
                     Text(L("↳ subagent of “\(parent)”", "↳ “\(parent)” oturumunun alt ajanı")).font(.caption2).foregroundStyle(.secondary).lineLimit(1)
                 }
-                Text([modelShort(s.model), runningSubs > 0 ? (runningSubs == 1 ? L("1 subagent", "1 alt ajan") : L("\(runningSubs) subagents", "\(runningSubs) alt ajan")) : nil,
+                Text([modelShort(s.model), s.account.map { "@" + $0 }, runningSubs > 0 ? (runningSubs == 1 ? L("1 subagent", "1 alt ajan") : L("\(runningSubs) subagents", "\(runningSubs) alt ajan")) : nil,
                       s.isRunning ? idle : L("ended", "bitti")].compactMap { $0 }.joined(separator: " · "))
                     .font(.caption).foregroundStyle(.secondary).lineLimit(1)
                 if s.isRunning, let st = stateText(s, now: now) {
@@ -2154,6 +2201,8 @@ struct QuotaCard: View {
     let now: Double
     var collapsed = false
     var toggle: () -> Void = {}
+    @AppStorage(Pref.showLocal) private var showLocal = true
+    func share(_ w: QuotaWindow) -> LocalShare? { showLocal ? item.local?[w.label] : nil }
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
             HStack {
@@ -2181,10 +2230,11 @@ struct QuotaCard: View {
                     .help(item.unavailableHttp.map { L("HTTP \(Int($0)) from the provider", "Sağlayıcıdan HTTP \(Int($0))") } ?? "")
             }
             if collapsed {
-                ForEach(windows, id: \.label) { w in CompactQuotaRow(window: w, now: now) }.opacity(item.stale == true ? 0.6 : 1)
+                ForEach(windows, id: \.label) { w in CompactQuotaRow(window: w, now: now, share: share(w)) }.opacity(item.stale == true ? 0.6 : 1)
             } else {
             ForEach(windows, id: \.label) { w in
-                QuotaRow(window: w, burn: item.stale == true ? nil : burn.first { $0.provider == item.provider && $0.window == w.label }, now: now)
+                QuotaRow(window: w, burn: item.stale == true ? nil : burn.first { $0.provider == item.provider && $0.window == w.label }, now: now,
+                         share: share(w))
                     .opacity(item.stale == true ? 0.6 : 1)
             }
             let pts = history.flatMap { h in
@@ -2227,11 +2277,17 @@ struct QuotaCard: View {
 struct CompactQuotaRow: View {
     let window: QuotaWindow
     let now: Double
+    var share: LocalShare? = nil
     var body: some View {
         let used = window.used ?? 0
         HStack(spacing: 8) {
             Text(wName(window.label)).font(.caption).frame(width: 78, alignment: .leading).lineLimit(1)
-            ProgressView(value: min(used, 100), total: 100).tint(levelColor(used)).frame(maxWidth: .infinity)
+            ShareBar(used: used, local: share?.local, height: 4).frame(maxWidth: .infinity)
+            if let mine = share?.local, share?.basis != "idle" {
+                Text(L("Mac ≈\(Int(mine.rounded()))", "Mac ≈\(Int(mine.rounded()))")).font(.caption2).monospacedDigit()
+                    .foregroundStyle(.secondary).fixedSize()
+                    .help(shareHelp(share!))
+            }
             Text(L("\(Int(used))%", "%\(Int(used))")).font(.caption.weight(.semibold)).monospacedDigit().frame(width: 38, alignment: .trailing)
             if let r = window.reset {
                 Text(span(r - now)).font(.caption2).foregroundStyle(.secondary).frame(width: 64, alignment: .trailing)
@@ -2240,10 +2296,51 @@ struct CompactQuotaRow: View {
     }
 }
 
+/// Account usage bar; with a local share the part this Mac caused is drawn solid and the rest (other computers)
+/// lighter, in the same level colour.
+struct ShareBar: View {
+    let used: Double
+    let local: Double?
+    var height: CGFloat = 6
+    var body: some View {
+        GeometryReader { g in
+            let w = g.size.width
+            let u = min(max(used, 0), 100) / 100
+            let l = min(max(local ?? used, 0), used) / 100
+            ZStack(alignment: .leading) {
+                Capsule().fill(Color.secondary.opacity(0.18))
+                Capsule().fill(levelColor(used).opacity(local == nil ? 1 : 0.38)).frame(width: w * u)
+                if local != nil { Capsule().fill(levelColor(used)).frame(width: w * l) }
+            }
+            .animation(motionOn() ? .easeOut(duration: 0.6) : nil, value: used)
+        }
+        .frame(height: height)
+    }
+}
+
+/// "This Mac ≈13% · other ≈7%" and how it was worked out.
+func shareLine(_ s: LocalShare) -> String? {
+    guard let mine = s.local else { return L("This Mac: unknown (some requests could not be matched to an account)", "Bu Mac: bilinmiyor (bazı istekler bir hesaba eşlenemedi)") }
+    if s.basis == "idle" { return L("This Mac: 0% — all from elsewhere", "Bu Mac: %0 — hepsi başka yerden") }
+    let m = Int(mine.rounded()), o = Int((s.other ?? 0).rounded())
+    let pre = s.basis == "bound" ? L("at most ", "en fazla ") : "≈"
+    return L("This Mac \(pre)\(m)% · elsewhere \(s.basis == "bound" ? "≥" : "≈")\(o)%", "Bu Mac \(pre)%\(m) · diğer \(s.basis == "bound" ? "≥" : "≈")%\(o)")
+}
+
+func shareHelp(_ s: LocalShare) -> String {
+    var t = L("Estimate. Anthropic only reports the account total; this Mac's part comes from what ran here (Claude Code + Hermes, API-equivalent \(money(s.localCost)))",
+              "Tahmin. Anthropic yalnızca hesabın toplamını verir; bu Mac'in payı burada çalışanlardan (Claude Code + Hermes, API karşılığı \(money(s.localCost)))")
+    if let r = s.rate { t += L(" at ≈\(String(format: "%.2f", r))% per $ learned from this account's history", " ve bu hesabın geçmişinden öğrenilen $ başına ≈%\(String(format: "%.2f", r)) ile") }
+    t += L(", never more than the rise seen while this Mac was busy.", " hesaplanır; bu Mac çalışırken görülen artıştan fazla olamaz.")
+    if s.basis == "bound" { t += L(" Too little history for a rate yet: the value is an upper limit.", " Oran için henüz yeterli geçmiş yok: değer bir üst sınır.") }
+    return t
+}
+
 struct QuotaRow: View {
     let window: QuotaWindow
     let burn: Burn?
     let now: Double
+    var share: LocalShare? = nil
     var body: some View {
         let used = window.used ?? 0
         // at the current burn rate the window fills up before it resets
@@ -2263,8 +2360,10 @@ struct QuotaRow: View {
                     .animation(motionOn() ? .snappy : nil, value: used)
                     .font(.callout.weight(.semibold)).monospacedDigit()
             }
-            ProgressView(value: min(used, 100), total: 100).tint(levelColor(used))
-                .animation(motionOn() ? .easeOut(duration: 0.6) : nil, value: used)
+            ShareBar(used: used, local: share?.local)
+            if let s = share, let line = shareLine(s) {
+                Text(line).font(.caption2).monospacedDigit().foregroundStyle(.secondary).help(shareHelp(s))
+            }
             HStack {
                 if let r = window.reset { Text(L("resets \(when(r, now: now))", "sıfırlanma \(when(r, now: now))")) }
                 Spacer()
@@ -3236,6 +3335,7 @@ struct RingGauge: View {
     let provider: String
     let fractions: [Double]
     var size: CGFloat = 20
+    var badge: String? = nil  // account initial, when the provider has several accounts
     var body: some View {
         ZStack {
             ForEach(Array(fractions.prefix(2).enumerated()), id: \.offset) { i, f in
@@ -3254,6 +3354,14 @@ struct RingGauge: View {
             }
         }
         .frame(width: size, height: size)
+        .overlay(alignment: .bottomTrailing) {
+            if let b = badge {
+                Text(b).font(.system(size: size * 0.36, weight: .heavy, design: .rounded)).foregroundStyle(.black)
+                    .frame(minWidth: size * 0.42, minHeight: size * 0.42)
+                    .background(Circle().fill(Color.white))
+                    .offset(x: size * 0.14, y: size * 0.1)
+            }
+        }
     }
 }
 
@@ -3294,15 +3402,21 @@ struct IslandView: View {
     @AppStorage(Pref.hoverQuotas) private var hoverQuotas = true
     @AppStorage(Pref.hoverSessions) private var hoverSessions = true
     @AppStorage(Pref.hoverCost) private var hoverCost = true
+    @AppStorage(Pref.islandQuotas) private var islandQuotas = "bar"
+    @AppStorage(Pref.islandBadge) private var badge = true
+    @AppStorage(Pref.quotaScope) private var scope = "account"
+    @AppStorage(Pref.showLocal) private var showLocal = true
 
+    /// Left ear: one ring per account (provider item), in selection order; a wider ear fits a third.
     var groups: [(provider: String, fractions: [Double], stale: Bool)] {
+        _ = (quotas, islandQuotas, scope)  // read so SwiftUI redraws when the selection changes
         var order: [String] = []
         var fr: [String: [Double]] = [:]
-        for c in store.chosenQuotas(quotas.split(separator: ",").map(String.init)) {
+        for c in store.chosenQuotas(store.islandSelection) {
             if fr[c.provider] == nil { order.append(c.provider) }
             fr[c.provider, default: []].append((c.window.used ?? 0) / 100)
         }
-        return order.prefix(2).map { ($0, fr[$0]!, store.isStale($0)) }
+        return order.prefix(earWidth >= 76 ? 3 : 2).map { ($0, fr[$0]!, store.isStale($0)) }
     }
 
     var body: some View {
@@ -3342,11 +3456,13 @@ struct IslandView: View {
     /// Left: quota rings; right: running sessions — both sit beside the camera, never under it.
     var ears: some View {
         HStack(spacing: 0) {
-            HStack(spacing: 6) {
+            HStack(spacing: groups.count > 2 ? 3 : 6) {
                 ForEach(groups, id: \.provider) { g in
-                    RingGauge(provider: g.provider, fractions: g.fractions, size: 20)
+                    RingGauge(provider: g.provider, fractions: g.fractions, size: 20,
+                              badge: badge ? accountShort(g.provider).map { String($0.prefix(1)).uppercased() } : nil)
                         .opacity(g.stale ? 0.55 : 1)
-                        .help(g.stale ? L("Last known value (rate limited)", "Son değer (hız sınırı)") : "")
+                        .help([accountShort(g.provider), g.stale ? L("Last known value (rate limited)", "Son değer (hız sınırı)") : nil]
+                              .compactMap { $0 }.joined(separator: " · "))
                         .scaleEffect(island.highlight == g.provider ? 1.3 : 1)
                         .shadow(color: island.highlight == g.provider ? levelColor((g.fractions.first ?? 0) * 100) : .clear, radius: 6)
                 }
@@ -3427,9 +3543,16 @@ struct IslandView: View {
                     }
                     Text("\(pName(o.provider)) · \(wName(o.window.label))").font(.system(size: 11.5)).foregroundStyle(.white).lineLimit(1)
                     Spacer(minLength: 4)
+                    // the other number: this Mac's share next to the account value (or the account value in "This Mac" mode)
+                    if showLocal, let sh = store.localShare(o.provider, o.window.label), let mine = sh.local {
+                        let acct = Int(store.accountUsed(o.provider, o.window.label) ?? 0)
+                        Text(scope == "local" ? L("acct \(acct)%", "hesap %\(acct)")
+                                              : L("Mac ≈\(Int(mine.rounded()))%", "Mac ≈%\(Int(mine.rounded()))"))
+                            .font(.system(size: 10)).monospacedDigit().foregroundStyle(.white.opacity(0.55)).lineLimit(1).fixedSize()
+                    }
                     Capsule().fill(Color.white.opacity(0.14)).frame(width: 70, height: 4)
                         .overlay(alignment: .leading) { Capsule().fill(levelColor(used)).frame(width: 70 * min(used, 100) / 100, height: 4) }
-                    Text("\(Int(used))%").font(.system(size: 11.5, weight: .semibold)).monospacedDigit().foregroundStyle(.white)
+                    Text(L("\(Int(used.rounded()))%", "%\(Int(used.rounded()))")).font(.system(size: 11.5, weight: .semibold)).monospacedDigit().foregroundStyle(.white)
                         .frame(width: 36, alignment: .trailing)
                 }
             }
@@ -3614,6 +3737,11 @@ struct SettingsTab: View {
     @AppStorage(Pref.hoverSessions) private var hoverSessions = true
     @AppStorage(Pref.hoverCost) private var hoverCost = true
     @AppStorage(Pref.islandClick) private var islandClick = "panel"
+    @AppStorage(Pref.islandQuotas) private var islandQuotas = "bar"
+    @AppStorage(Pref.islandBadge) private var islandBadge = true
+    // quotas
+    @AppStorage(Pref.quotaScope) private var quotaScope = "account"
+    @AppStorage(Pref.showLocal) private var showLocal = true
     // notifications & budget
     @AppStorage(Pref.notifyQuota) private var nQuota = true
     @AppStorage(Pref.notifyKanban) private var nKanban = true
@@ -3633,6 +3761,7 @@ struct SettingsTab: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 12) {
             appearance
+            quotaSection
             if display != "island" || !hasNotch { menuBar }
             if hasNotch && display != "menubar" { island }
             notifications
@@ -3663,6 +3792,22 @@ struct SettingsTab: View {
                 }
             }
             Toggle(L("Animations", "Animasyonlar"), isOn: $motion)
+        }
+    }
+
+    /// Account-wide vs. this Mac: Anthropic reports one number per account; what this Mac caused is estimated.
+    var quotaSection: some View {
+        SettingsSection(title: L("Quotas", "Kotalar"), icon: "gauge.with.dots.needle.50percent") {
+            SegmentRow(title: L("Percent shows", "Yüzde")) {
+                Picker("", selection: $quotaScope) {
+                    Text(L("Account", "Hesap")).tag("account")
+                    Text(L("This Mac", "Bu Mac")).tag("local")
+                }
+            }
+            Toggle(L("Show this Mac's share next to it", "Yanında bu Mac'in payını göster"), isOn: $showLocal)
+            Text(L("Applies to the menu bar, the notch rings and the hover panel; cards always show the account. This Mac's share is an estimate (Claude Code + Hermes on this Mac against the account's history) — useful when the same account is also used on another computer.",
+                   "Menü çubuğu, çentik halkaları ve açılır panel için geçerli; kartlar her zaman hesabı gösterir. Bu Mac'in payı bir tahmindir (bu Mac'teki Claude Code + Hermes, hesabın geçmişiyle) — aynı hesap başka bir bilgisayarda da kullanılıyorsa işe yarar."))
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
@@ -3725,6 +3870,27 @@ struct SettingsTab: View {
             }
             SliderRow(title: L("Side width", "Yan genişlik"), value: $earWidth, range: 40...96, step: 4,
                       format: { "\(Int($0)) pt" })
+            Divider()
+            Text(L("Left side: quota rings (one per account; 3 fit from 76 pt)", "Sol taraf: kota halkaları (hesap başına bir; 76 pt'den itibaren 3 sığar)"))
+                .font(.caption).foregroundStyle(.secondary)
+            Toggle(L("Same quotas as the menu bar", "Menü çubuğuyla aynı kotalar"), isOn: Binding(
+                get: { islandQuotas == "bar" || islandQuotas.isEmpty },
+                set: { same in islandQuotas = same ? "bar" : Pref.str(Pref.barQuotas) }))
+            if !(islandQuotas == "bar" || islandQuotas.isEmpty) {
+                Toggle(L("Auto: fullest usable quota", "Otomatik: en dolu kullanılabilir kota"), isOn: islandBinding("auto"))
+                ForEach(store.quotaOptions, id: \.key) { o in
+                    Toggle(isOn: islandBinding(o.key)) {
+                        HStack(spacing: 6) {
+                            if let ic = providerIcon(o.provider) {
+                                Image(nsImage: ic).renderingMode(.template).resizable().scaledToFit().frame(width: 12)
+                            }
+                            Text("\(pName(o.provider)) · \(wName(o.window.label))")
+                            Text(L("\(Int(o.window.used ?? 0))%", "%\(Int(o.window.used ?? 0))")).foregroundStyle(.secondary).monospacedDigit()
+                        }
+                    }
+                }
+            }
+            Toggle(L("Account initial on the rings (several accounts)", "Halkalarda hesabın baş harfi (birden fazla hesap)"), isOn: $islandBadge)
             Divider()
             Toggle(L("Pop alerts out of the notch", "Uyarıları çentikten göster"), isOn: $islandEvents)
             SliderRow(title: L("Peek on change for", "Değişince görünme süresi"), value: $peekSec, range: 5...30, step: 1, format: seconds)
@@ -3807,6 +3973,15 @@ struct SettingsTab: View {
             Text(L("Resets every setting on this page except the language.", "Dil hariç bu sayfadaki tüm ayarları sıfırlar."))
                 .font(.caption2).foregroundStyle(.secondary)
         }
+    }
+
+    /// Toggle one quota key in the notch's own selection.
+    func islandBinding(_ key: String) -> Binding<Bool> {
+        Binding(get: { islandQuotas.split(separator: ",").map(String.init).contains(key) }, set: { on in
+            var keys = islandQuotas.split(separator: ",").map(String.init).filter { $0 != key && $0 != "bar" }
+            if on { keys.append(key) }
+            islandQuotas = keys.isEmpty ? "auto" : keys.joined(separator: ",")
+        })
     }
 
     /// Toggle one quota key in the comma-joined selection (order of selection = order in the bar).

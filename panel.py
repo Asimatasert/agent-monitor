@@ -32,6 +32,7 @@ import hermes_bootstrap  # noqa: E402,F401 — sets up Hermes' dependency paths
 sys.path.insert(0, str(Path(__file__).parent))
 import clis  # noqa: E402
 import health  # noqa: E402
+import localshare  # noqa: E402
 
 try:
     PORT = int(os.environ.get("AGENT_MONITOR_PORT") or 8777)
@@ -510,6 +511,16 @@ def _anthropic_read_creds(entries, force=False):
     return rows
 
 
+def account_name(accs):
+    """Display name of an account item: the label you gave its first credential in Hermes' pool (priority order),
+    skipping the Claude Code login (its label just says "claude_code") and credentials not verified to be this
+    account. Runtime data only: it is read from auth.json and never stored."""
+    mine = [a for a in accs if a.get("verification") != "unverified"]
+    named = [a for a in mine if a.get("source") != "claude_code" and a.get("label")]
+    pick = (named or mine or [{}])[0]
+    return pick.get("label") or None
+
+
 def _anthropic_account_items(force=False):
     """Claude OAuth credentials in Hermes' pool grouped by the ACCOUNT behind them (provider id
     "anthropic#<account-key>"), each read with its own token; None when the pool has fewer than 2 OAuth entries.
@@ -542,7 +553,8 @@ def _anthropic_account_items(force=False):
         http = g.get("http") if err else None
         code = None if not err else "rate_limited" if http == 429 else "usage_unreadable"
         item = {"provider": f"anthropic#{g['key']}" if g["key"] else "anthropic",
-                "account_key": g["key"], "accounts": accs, "windows": g["wins"], "details": [], "plan": None,
+                "account_key": g["key"], "name": account_name(accs) if g["key"] else None,
+                "accounts": accs, "windows": g["wins"], "details": [], "plan": None,
                 "unavailable": (f"{err} (HTTP {http})" if http else err) if err else None,
                 "unavailable_code": code, "unavailable_http": http,
                 "retry_at": time.time() + _anthropic_wait() if code == "rate_limited" and _anthropic_wait() > 0 else None}
@@ -684,8 +696,12 @@ def _refresh_quotas(force=False):
     try:
         try:
             items = _fetch_quotas(force)
-            _quota_cache["data"] = {"items": items, "error": None}
             _record_quotas(items)
+            try:
+                _attach_local(items)
+            except Exception as e:  # the account-wide numbers stand on their own
+                print(f"local share: {e}", file=sys.stderr)
+            _quota_cache["data"] = {"items": items, "error": None}
         except Exception as e:
             _quota_cache["data"] = {"items": [], "error": str(e)}
         _quota_cache["at"] = time.time()
@@ -731,6 +747,139 @@ def _quota_recorder():
         except Exception:
             pass
         time.sleep(QUOTA_RECORD_EVERY)
+
+
+# ---------- this Mac's share of a shared Claude account (see localshare.py) ----------
+
+LOCAL_LOOKBACK = 8 * 86400  # a week window plus a day to learn the rate from
+
+
+def is_anthropic(provider):
+    return provider == "anthropic" or str(provider).startswith("anthropic#")
+
+
+def _quota_readings(providers, since):
+    """{provider: {window: sorted [(ts, used, reset)]}} from quota_history (old per-label ids follow the account)."""
+    out = defaultdict(lambda: defaultdict(list))
+    if not PANEL_DB.exists():
+        return out
+    with rw(PANEL_DB) as c:
+        c.execute("""CREATE TABLE IF NOT EXISTS quota_history
+                     (ts REAL, provider TEXT, window TEXT, used REAL, reset REAL)""")
+        rows = c.execute("""SELECT ts, provider, window, used, reset FROM quota_history
+                            WHERE ts >= ? AND (provider = 'anthropic' OR provider LIKE 'anthropic#%')""",
+                         (since,)).fetchall()
+    for ts, prov, win, used, reset in rows:
+        p = _anthropic_aliases.get(prov, prov)
+        if p in providers:
+            out[p][win].append((ts, used, reset))
+    for wins in out.values():
+        for rs in wins.values():
+            rs.sort()
+    return out
+
+
+def _local_claude_events(since):
+    """Claude Code requests on this Mac (main + subagents): [(ts, API-equivalent $, model)]."""
+    return [(e["ts"], e["cost"], e["model"]) for _, _, cf in clis.claude_sessions(since)
+            for e in cf.events if e["ts"] >= since]
+
+
+def _local_hermes_events(since):
+    """Hermes requests on this Mac that went to Anthropic, every profile: [(ts, $, model)]. Hermes keeps cost per
+    session and model, not per request: each usage row's cost is spread over that session's assistant messages
+    inside the row's first/last-seen span (or put at last_seen when there are none)."""
+    out = []
+    for _, home in profile_homes():
+        db = home / "state.db"
+        if not db.exists():
+            continue
+        try:
+            with ro(db) as c:
+                rows = c.execute("""SELECT session_id, model, estimated_cost_usd est, actual_cost_usd act,
+                                           input_tokens i, output_tokens o, cache_read_tokens cr,
+                                           cache_write_tokens cw, first_seen, last_seen
+                                    FROM session_model_usage
+                                    WHERE billing_provider = 'anthropic' AND coalesce(last_seen, 0) >= ?""",
+                                 (since,)).fetchall()
+                ids = sorted({r["session_id"] for r in rows})
+                stamps = defaultdict(list)
+                for i in range(0, len(ids), 500):
+                    part = ids[i:i + 500]
+                    for m in c.execute(f"""SELECT session_id, timestamp FROM messages WHERE role = 'assistant'
+                                           AND session_id IN ({','.join('?' * len(part))})""", part):
+                        stamps[m[0]].append(m[1])
+        except sqlite3.Error:
+            continue
+        for r in rows:
+            cost = r["act"] or r["est"] or 0.0
+            if not cost:
+                cost = clis._cost({"model": r["model"], "input": r["i"] or 0, "output": r["o"] or 0,
+                                   "cache_read": r["cr"] or 0, "cache_write": r["cw"] or 0})
+            if not cost:
+                continue
+            lo, hi = (r["first_seen"] or 0) - 1, (r["last_seen"] or 0) + 1
+            ts = [t for t in stamps.get(r["session_id"], []) if lo <= t <= hi] or [r["last_seen"]]
+            out += [(t, cost / len(ts), r["model"]) for t in ts if t and t >= since]
+    return out
+
+
+def _anthropic_routing(items):
+    """Which account each local client uses -> (claude_code item provider | None, Hermes pool order, fill_first).
+    Hermes order: the item provider of every pooled Claude credential in priority order (None = its account is
+    not known)."""
+    from agent.credential_pool import STRATEGY_FILL_FIRST, get_pool_strategy, load_pool
+
+    def owner(label, source):
+        for it in items:
+            for a in it.get("accounts") or []:
+                if a.get("label") == label and a.get("source") == source and a.get("verification") != "unverified":
+                    return it["provider"]
+        return items[0]["provider"] if len(items) == 1 else None
+
+    cc = next((it["provider"] for it in items for a in it.get("accounts") or []
+               if a.get("source") == "claude_code" and a.get("verification") != "unverified"), None)
+    entries = sorted(load_pool("anthropic").entries(), key=lambda e: (e.priority if e.priority is not None else 99))
+    order = [owner(e.label, e.source) for e in entries]
+    return cc, order, get_pool_strategy("anthropic") == STRATEGY_FILL_FIRST
+
+
+_routing = {"cc": None, "order": [], "fill_first": False, "multi": False}
+
+
+def _attach_local(items, now=None):
+    """Adds `local` to every Claude quota item: {window label: {local, other, local_cost, basis, rate}}."""
+    now = now or time.time()
+    claude = [it for it in items if is_anthropic(it["provider"])]
+    if not claude:
+        return
+    cc, order, fill_first = _anthropic_routing(claude)
+    _routing.update(cc=cc, order=order, fill_first=fill_first, multi=len(claude) > 1)
+    since = now - LOCAL_LOOKBACK
+    provs = [it["provider"] for it in claude]
+    history = _quota_readings(set(provs), since)
+    by, lost = localshare.attribute(provs, cc, order, fill_first, history,
+                                    _local_claude_events(since), _local_hermes_events(since))
+    res = localshare.shares(claude, history, by, lost, now)
+    for it in claude:
+        it["local"] = res.get(it["provider"]) or {}
+
+
+def session_account(kind, provider, model, items, now=None):
+    """(item provider, display name) of the Claude account a running session uses, or (None, None).
+    Claude Code: its own login. Hermes on Anthropic: where the fill_first pool sends a request now."""
+    claude = {it["provider"]: it for it in items if is_anthropic(it["provider"])}
+    if len(claude) < 2:
+        return None, None
+    if kind == "claude-code":
+        p = _routing["cc"]
+    elif kind == "hermes" and provider == "anthropic" and _routing["fill_first"]:
+        cur = {p: {w["label"]: [(now or time.time(), w.get("used"), w.get("reset"))] for w in it.get("windows") or []}
+               for p, it in claude.items()}
+        p = localshare.hermes_account(_routing["order"], cur, now or time.time())
+    else:
+        p = None
+    return (p, claude[p].get("name")) if p in claude else (None, None)
 
 
 # ---------- usage (overview / accounts) ----------
@@ -1566,8 +1715,12 @@ def live():
             running.append(card_only_row(card, now))
     by_id = {(r["profile"], r["id"]): r for r in running}
     table = proc_table()
+    q = quotas()
     for r in running:
         r["open"] = _open_for(r, by_id, table)
+        # the Claude account (its name in Hermes' pool) a session runs on, when there are several
+        r["account_provider"], r["account"] = session_account(r.get("kind"), r.get("provider"), r.get("model"),
+                                                              q.get("items") or [], now)
         for k in [k for k in r if k.startswith("_")]:
             del r[k]
 
@@ -1583,7 +1736,7 @@ def live():
         "last_1m": window_sum(60), "last_5m": window_sum(300), "last_60m": window_sum(3600),
         "by_source_60m": {k: window_sum(3600, k) for k in providers},
         "cost_60m": window_cost(3600),
-        "running": running, "counts": live_counts(running), "burn": burn, "quotas": quotas(),
+        "running": running, "counts": live_counts(running), "burn": burn, "quotas": q,
     }
 
 

@@ -341,5 +341,34 @@ class HermesState(unittest.TestCase):
         self.assertEqual(panel._hermes_state(self.conn(None, 900), "s", None, time.time())["state"], "stalled")
 
 
+class AccountNames(unittest.TestCase):
+    def test_name_skips_the_claude_code_login_and_unverified(self):
+        accs = [{"label": "tok", "source": "env:X", "verification": "unverified"},
+                {"label": "claude_code", "source": "claude_code", "verification": "verified"},
+                {"label": "work", "source": "manual", "verification": "verified"}]
+        self.assertEqual(panel.account_name(accs), "work")
+
+    def test_only_the_claude_code_login_names_by_its_label(self):
+        self.assertEqual(panel.account_name([{"label": "claude_code", "source": "claude_code"}]), "claude_code")
+
+    def test_session_account_needs_two_accounts(self):
+        items = [{"provider": "anthropic", "name": None, "windows": []}]
+        self.assertEqual(panel.session_account("claude-code", "", None, items), (None, None))
+
+    def test_session_account_routes_like_the_pool(self):
+        items = [{"provider": "anthropic#a", "name": "work", "windows": [{"label": "Current session", "used": 100.0, "reset": 1}]},
+                 {"provider": "anthropic#b", "name": "home", "windows": [{"label": "Current session", "used": 5.0, "reset": 1}]}]
+        saved = dict(panel._routing)
+        try:
+            panel._routing.update(cc="anthropic#a", order=["anthropic#a", "anthropic#b"], fill_first=True)
+            self.assertEqual(panel.session_account("claude-code", "", None, items), ("anthropic#a", "work"))
+            # the first account is full: Hermes' pool sends the next request to the second one
+            self.assertEqual(panel.session_account("hermes", "anthropic", None, items), ("anthropic#b", "home"))
+            self.assertEqual(panel.session_account("hermes", "openrouter", None, items), (None, None))
+        finally:
+            panel._routing.clear()
+            panel._routing.update(saved)
+
+
 if __name__ == "__main__":
     unittest.main()

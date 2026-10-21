@@ -56,6 +56,11 @@ Hermes' own account-usage helpers, which may refresh an expiring OAuth token whi
   them (Anthropic OAuth profile), so two credentials of one Claude account are one entry, while two real
   accounts are shown separately (with a hint when one is nearly full and another has room); a credential whose
   account cannot be read (HTTP 403) is listed as unverified, never as an account of its own; steady quotas collapse and reopen on every 2 % step
+- **This Mac vs. the account** — for a Claude account also used on another computer, each window shows how much
+  of it this Mac caused (≈, estimated from Claude Code + Hermes usage here against the account's history) and how
+  much came from elsewhere; accounts carry the name you gave them in Hermes' pool, and live sessions show which
+  account they run on (`@name`). Settings: percentages as account or this Mac, the notch's own quota rings
+  (one per account, with the account's initial)
 - **Health** — per-account status and errors, per-model error rates, and each profile's fallback chain
   (which fallbacks Hermes would actually skip and why)
 - **Usage** — daily/monthly budget with month-end projection, 7-day costs, top models, profiles and sessions
